@@ -58,7 +58,6 @@ def standardize_filenames(folder, structure, destination, progress_var, progress
     progress_var.set(0)
     progress_bar['maximum'] = total_files
 
-    # Forzar actualización de interfaz
     root.update_idletasks()
 
     for series, seasons in structure.items():
@@ -123,30 +122,21 @@ def move_videos_and_delete_subfolders(parent_folder):
             dir_path = os.path.join(root, dir)
             try:
                 os.rmdir(dir_path)
-            except OSError as e:
-                # Puede no ser vacía, ignoramos o mostramos un error
+            except OSError:
                 pass
 
 def populate_treeview(tree, structure):
-    # Limpia el treeview
     for i in tree.get_children():
         tree.delete(i)
 
-    # Estructura:
-    # si key es "Películas", entonces es una lista: [(orig,new), ...]
-    # si key es una serie, es un dict: { "Temporada X": [(orig,new), ...], ... }
-
     for series, seasons in structure.items():
-        # Crear nodo principal
         parent_node = tree.insert("", "end", text=series, open=True)
         if isinstance(seasons, dict):
-            # Es una serie, con temporadas
             for season, episodes in seasons.items():
                 season_node = tree.insert(parent_node, "end", text=season, open=True)
                 for original, new in episodes:
                     tree.insert(season_node, "end", text=new)
         else:
-            # Es películas (lista)
             for original, new in seasons:
                 tree.insert(parent_node, "end", text=new)
 
@@ -161,7 +151,6 @@ def analizar_carpeta():
     if not struct:
         messagebox.showinfo("Resultado", "No se han encontrado archivos de video para procesar.")
         estructura_actual.clear()
-        # Limpiar el treeview
         for i in tree.get_children():
             tree.delete(i)
         btn_confirmar.config(state='disabled')
@@ -171,7 +160,6 @@ def analizar_carpeta():
     estructura_actual.clear()
     estructura_actual.update(struct)
     btn_confirmar.config(state='normal')
-
 
 def elegir_carpeta_origen():
     ruta = filedialog.askdirectory()
@@ -196,14 +184,12 @@ def confirmar():
 
 
 # Rutas por defecto
-current_folder = os.path.dirname(os.path.abspath(__file__))
+current_folder = r"C:\Users\david\Downloads\Torrent"
 destination_folder = r'\\Nas\nas'
 
-# Ventana principal
 root = tk.Tk()
 root.title("Organizador de archivos multimedia")
 
-# Variables de control
 carpeta_var = tk.StringVar(value=current_folder)
 destino_var = tk.StringVar(value=destination_folder)
 estructura_actual = {}
@@ -238,7 +224,6 @@ frame_tree.pack(padx=10, pady=10, fill='both', expand=True)
 tree = ttk.Treeview(frame_tree, columns=('name',), show='tree')
 tree.pack(fill='both', expand=True)
 
-# Barra de progreso
 frame_progress = ttk.Frame(root)
 frame_progress.pack(padx=10, pady=10, fill='x')
 progress_var = tk.IntVar()
