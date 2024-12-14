@@ -2,48 +2,49 @@ import os
 import re
 import shutil
 from tqdm import tqdm
+from guessit import guessit
 
-def clean_series_name(name):
-    # Dividir por el primer guion, número o carácter especial, excluyendo resoluciones como 720p
-    name = re.split(r' -|[\[\(\{]', name, 1)[0]
-    name = re.sub(r'[\._-]+', ' ', name)
-    name = re.sub(r'\s+', ' ', name).strip()
-    # Eliminar palabras no deseadas como "Temporada", "Temp", etc.
-    name = re.sub(r'\b(T|t)emporada\b', '', name).strip()
-    name = re.sub(r'\b(T|t)emp\b', '', name).strip()
-    return name
+def extract_info(filename):
+    info = guessit(filename)
+    # Ejemplo de la estructura que guessit puede devolver:
+    # {
+    #  'title': 'Breaking Bad',
+    #  'season': 1,
+    #  'episode': 1,
+    #  'type': 'episode',
+    #  'container': 'mkv'
+    # }
+    #
+    # Si es película:
+    # {
+    #  'title': 'Inception',
+    #  'year': 2010,
+    #  'type': 'movie',
+    #  'container': 'mp4'
+    # }
 
-def extract_season_episode(filename):
-    # Primero buscar formato 1x01
-    match = re.search(r'(\d{1,2})x(\d{2})', filename, re.IGNORECASE)
-    if match:
-        season = int(match.group(1))
-        episode = int(match.group(2))
-        return season, episode
-
-    # Luego buscar formato 101, 1109, etc., excluyendo resoluciones de video
-    match = re.search(r'(?<!\d)(\d)(\d{2})(?!p)', filename)
-    if match:
-        season = int(match.group(1))
-        episode = int(match.group(2))
-        return season, episode
-
-    match = re.search(r'(?<!\d)(\d{2})(\d{2})(?!p)', filename)
-    if match:
-        season = int(match.group(1)[0])
-        episode = int(match.group(2))
-        return season, episode
-    
-    return None, None
-
-def extract_movie_number(name):
-    # Buscar números al final del nombre de la película
-    match = re.search(r'(.+?)(\d+)$', name)
-    if match:
-        title = match.group(1).strip()
-        number = match.group(2)
-        return f"{title} {number}"
-    return name
+    if info.get('type') == 'episode':
+        series_name = info.get('title', 'Desconocido')
+        season = info.get('season')
+        episode = info.get('episode')
+        ext = '.' + info.get('container', 'mkv')
+        # Estandarizar nombre de episodio de serie
+        new_filename = f"{series_name} - {season}x{episode:02d}{ext}"
+        return ('series', series_name, season, episode, new_filename)
+    elif info.get('type') == 'movie':
+        movie_name = info.get('title', 'Pelicula_Desconocida')
+        year = info.get('year')
+        ext = '.' + info.get('container', 'mkv')
+        # Estandarizar nombre de película
+        if year:
+            new_filename = f"{movie_name} ({year}){ext}"
+        else:
+            new_filename = f"{movie_name}{ext}"
+        return ('movie', movie_name, None, None, new_filename)
+    else:
+        # Caso no identificado, lo tratamos como película genérica
+        ext = '.' + info.get('container', 'mkv') if 'container' in info else '.mkv'
+        return ('movie', 'Pelicula_Desconocida', None, None, f"Pelicula_Desconocida{ext}")
 
 def standardize_filenames_preview(folder):
     video_extensions = ['.avi', '.mkv', '.mp4', '.mov', '.wmv', '.flv']
@@ -51,19 +52,15 @@ def standardize_filenames_preview(folder):
     
     for filename in os.listdir(folder):
         if any(filename.lower().endswith(ext) for ext in video_extensions):
-            base_filename, ext = os.path.splitext(filename)
-            ext = ext.lower()  # Asegurarse de que la extensión esté en minúsculas
-            series_name = clean_series_name(base_filename)
-            season, episode = extract_season_episode(base_filename)
-            
-            if season is not None and episode is not None:
-                new_filename = f"{series_name} - {season}x{episode:02d}{ext}"
-                series_folder = series_name
+            file_path = os.path.join(folder, filename)
+            content_type, name, season, episode, new_filename = extract_info(filename)
+
+            if content_type == 'series':
+                series_folder = name
                 season_folder = f"Temporada {season}"
                 structure.setdefault(series_folder, {}).setdefault(season_folder, []).append((filename, new_filename))
             else:
-                movie_name = extract_movie_number(base_filename)
-                new_filename = f"{movie_name}{ext}"
+                # Es película
                 structure.setdefault("Películas", []).append((filename, new_filename))
     
     return structure
@@ -86,11 +83,16 @@ def standardize_filenames(folder, structure, destination):
     movies_destination = os.path.join(destination, "Películas")
     os.makedirs(movies_destination, exist_ok=True)
 
-    total_files = sum(len(episodes) for seasons in structure.values() for episodes in seasons.values())
+    # Sumar el número de archivos
+    total_files = sum(
+    sum(len(ep_list) for ep_list in seasons.values()) if isinstance(seasons, dict) else len(seasons)
+    for seasons in structure.values()
+    )
+
 
     with tqdm(total=total_files, desc="Moviendo archivos", unit="archivo") as pbar:
         for series, seasons in structure.items():
-            if isinstance(seasons, dict):
+            if isinstance(seasons, dict):  # Caso para series
                 series_folder = os.path.join(folder, series)
                 dest_series_folder = os.path.join(series_destination, series)
                 os.makedirs(series_folder, exist_ok=True)
@@ -116,7 +118,7 @@ def standardize_filenames(folder, structure, destination):
                         except Exception as e:
                             print(f"Error al mover '{original}': {e}")
                         pbar.update(1)
-            else:
+            else:  # Caso para películas
                 movies_folder = os.path.join(folder, "Películas")
                 dest_movies_folder = movies_destination
                 os.makedirs(movies_folder, exist_ok=True)
