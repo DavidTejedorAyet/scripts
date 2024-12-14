@@ -1,16 +1,30 @@
 import os
 import re
 import shutil
-from guessit import guessit
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import threading
+
+# Intentar importar guessit
+try:
+    from guessit import guessit
+except ImportError:
+    # No podemos mostrar un messagebox aquí porque posiblemente la ventana no exista todavía.
+    # Imprimiremos el error y salimos. Si usas un entorno donde ya existe un root, podrías usar messagebox.
+    print("La librería 'guessit' no está instalada. Ejecuta 'pip install guessit'.")
+    raise SystemExit
 
 def extract_info(filename):
-    info = guessit(filename)
+    try:
+        info = guessit(filename)
+    except Exception:
+        # Si guessit falla, lo tratamos como película desconocida
+        info = {'type': 'movie', 'container': 'mkv'}
+
     if info.get('type') == 'episode':
         series_name = info.get('title', 'Desconocido')
-        season = info.get('season')
-        episode = info.get('episode')
+        season = info.get('season', 1)
+        episode = info.get('episode', 1)
         ext = '.' + info.get('container', 'mkv')
         new_filename = f"{series_name} - {season}x{episode:02d}{ext}"
         return ('series', series_name, season, episode, new_filename)
@@ -31,7 +45,13 @@ def standardize_filenames_preview(folder):
     video_extensions = ['.avi', '.mkv', '.mp4', '.mov', '.wmv', '.flv']
     structure = {}
     
-    for filename in os.listdir(folder):
+    try:
+        items = os.listdir(folder)
+    except Exception as e:
+        messagebox.showerror("Error", f"No se pudo listar la carpeta origen: {e}")
+        return {}
+    
+    for filename in items:
         if any(filename.lower().endswith(ext) for ext in video_extensions):
             content_type, name, season, episode, new_filename = extract_info(filename)
             if content_type == 'series':
@@ -43,83 +63,98 @@ def standardize_filenames_preview(folder):
     
     return structure
 
-def standardize_filenames(folder, structure, destination, progress_var, progress_bar, root):
-    series_destination = os.path.join(destination, "Series")
-    os.makedirs(series_destination, exist_ok=True)
-    movies_destination = os.path.join(destination, "Películas")
-    os.makedirs(movies_destination, exist_ok=True)
+def standardize_filenames(folder, structure, destination, progress_var, progress_bar, root, on_complete):
+    def task():
+        errors = []
+        try:
+            series_destination = os.path.join(destination, "Series")
+            os.makedirs(series_destination, exist_ok=True)
+            movies_destination = os.path.join(destination, "Películas")
+            os.makedirs(movies_destination, exist_ok=True)
 
-    total_files = sum(
-        sum(len(ep_list) for ep_list in seasons.values()) if isinstance(seasons, dict) else len(seasons)
-        for seasons in structure.values()
-    )
+            total_files = sum(
+                sum(len(ep_list) for ep_list in seasons.values()) if isinstance(seasons, dict) else len(seasons)
+                for seasons in structure.values()
+            )
 
-    current_count = 0
-    progress_var.set(0)
-    progress_bar['maximum'] = total_files
+            current_count = 0
+            root.after(0, lambda: progress_bar.config(maximum=total_files))
 
-    root.update_idletasks()
+            for series, seasons in structure.items():
+                if isinstance(seasons, dict):  # Caso para series
+                    series_folder = os.path.join(folder, series)
+                    dest_series_folder = os.path.join(series_destination, series)
+                    os.makedirs(series_folder, exist_ok=True)
+                    os.makedirs(dest_series_folder, exist_ok=True)
+                    for season, episodes in seasons.items():
+                        season_folder = os.path.join(series_folder, season)
+                        dest_season_folder = os.path.join(dest_series_folder, season)
+                        os.makedirs(season_folder, exist_ok=True)
+                        os.makedirs(dest_season_folder, exist_ok=True)
+                        for original, new in episodes:
+                            old_filepath = os.path.join(folder, original)
+                            new_filepath = os.path.join(season_folder, new)
+                            dest_filepath = os.path.join(dest_season_folder, new)
+                            try:
+                                if os.path.exists(new_filepath):
+                                    os.remove(new_filepath)
+                                if old_filepath != new_filepath and os.path.exists(old_filepath):
+                                    shutil.move(old_filepath, new_filepath)
+                                if new_filepath != dest_filepath and os.path.exists(new_filepath):
+                                    shutil.move(new_filepath, dest_filepath)
+                            except Exception as e:
+                                errors.append(f"Error al mover '{original}': {e}")
+                            current_count += 1
+                            # Actualizar la barra de progreso
+                            root.after(0, lambda c=current_count: progress_var.set(c))
 
-    for series, seasons in structure.items():
-        if isinstance(seasons, dict):  # Caso para series
-            series_folder = os.path.join(folder, series)
-            dest_series_folder = os.path.join(series_destination, series)
-            os.makedirs(series_folder, exist_ok=True)
-            os.makedirs(dest_series_folder, exist_ok=True)
-            for season, episodes in seasons.items():
-                season_folder = os.path.join(series_folder, season)
-                dest_season_folder = os.path.join(dest_series_folder, season)
-                os.makedirs(season_folder, exist_ok=True)
-                os.makedirs(dest_season_folder, exist_ok=True)
-                for original, new in episodes:
-                    old_filepath = os.path.join(folder, original)
-                    new_filepath = os.path.join(season_folder, new)
-                    dest_filepath = os.path.join(dest_season_folder, new)
-                    try:
-                        if os.path.exists(new_filepath):
-                            os.remove(new_filepath)
-                        shutil.move(old_filepath, new_filepath)
-                        shutil.move(new_filepath, dest_filepath)
-                    except Exception as e:
-                        messagebox.showerror("Error", f"Error al mover '{original}': {e}")
-                    current_count += 1
-                    progress_var.set(current_count)
-                    root.update_idletasks()
-        else:  # Caso para películas
-            movies_folder = os.path.join(folder, "Películas")
-            dest_movies_folder = movies_destination
-            os.makedirs(movies_folder, exist_ok=True)
-            os.makedirs(dest_movies_folder, exist_ok=True)
-            for original, new in seasons:
-                old_filepath = os.path.join(folder, original)
-                new_filepath = os.path.join(movies_folder, new)
-                dest_filepath = os.path.join(dest_movies_folder, new)
-                try:
-                    if os.path.exists(new_filepath):
-                        os.remove(new_filepath)
-                    shutil.move(old_filepath, new_filepath)
-                    shutil.move(new_filepath, dest_filepath)
-                except Exception as e:
-                    messagebox.showerror("Error", f"Error al mover '{original}': {e}")
-                current_count += 1
-                progress_var.set(current_count)
-                root.update_idletasks()
+                else:  # Caso para películas
+                    movies_folder = os.path.join(folder, "Películas")
+                    dest_movies_folder = movies_destination
+                    os.makedirs(movies_folder, exist_ok=True)
+                    os.makedirs(dest_movies_folder, exist_ok=True)
+                    for original, new in seasons:
+                        old_filepath = os.path.join(folder, original)
+                        new_filepath = os.path.join(movies_folder, new)
+                        dest_filepath = os.path.join(dest_movies_folder, new)
+                        try:
+                            if os.path.exists(new_filepath):
+                                os.remove(new_filepath)
+                            if old_filepath != new_filepath and os.path.exists(old_filepath):
+                                shutil.move(old_filepath, new_filepath)
+                            if new_filepath != dest_filepath and os.path.exists(new_filepath):
+                                shutil.move(new_filepath, dest_filepath)
+                        except Exception as e:
+                            errors.append(f"Error al mover '{original}': {e}")
+                        current_count += 1
+                        # Actualizar la barra de progreso
+                        root.after(0, lambda c=current_count: progress_var.set(c))
 
-    messagebox.showinfo("Completado", "Los cambios han sido aplicados.")
+        except Exception as e:
+            errors.append(f"Error general: {e}")
 
+        # Llamar a on_complete en el hilo principal
+        def finish():
+            on_complete(errors)
+
+        root.after(0, finish)
+
+    threading.Thread(target=task, daemon=True).start()
 
 def move_videos_and_delete_subfolders(parent_folder):
     video_extensions = ['.avi', '.mkv', '.mp4', '.mov', '.wmv', '.flv']
-    for root, dirs, files in os.walk(parent_folder, topdown=False):
+    for root_dir, dirs, files in os.walk(parent_folder, topdown=False):
         for file in files:
             if any(file.lower().endswith(ext) for ext in video_extensions):
-                file_path = os.path.join(root, file)
-                try:
-                    shutil.move(file_path, parent_folder)
-                except Exception as e:
-                    messagebox.showerror("Error", f"Error al mover '{file_path}': {e}")
+                file_path = os.path.join(root_dir, file)
+                # Si el archivo ya está en la carpeta principal no lo movemos
+                if file_path != os.path.join(parent_folder, file):
+                    try:
+                        shutil.move(file_path, parent_folder)
+                    except:
+                        pass
         for dir in dirs:
-            dir_path = os.path.join(root, dir)
+            dir_path = os.path.join(root_dir, dir)
             try:
                 os.rmdir(dir_path)
             except OSError:
@@ -145,21 +180,29 @@ def analizar_carpeta():
     if not carpeta or not os.path.isdir(carpeta):
         messagebox.showerror("Error", "Por favor seleccione una carpeta de origen válida")
         return
-    move_videos_and_delete_subfolders(carpeta)
-    struct = standardize_filenames_preview(carpeta)
+    btn_analizar.config(state='disabled')
+    btn_confirmar.config(state='disabled')
 
+    def task():
+        move_videos_and_delete_subfolders(carpeta)
+        struct = standardize_filenames_preview(carpeta)
+        root.after(0, lambda: finalizar_analisis(struct))
+
+    threading.Thread(target=task, daemon=True).start()
+
+def finalizar_analisis(struct):
     if not struct:
         messagebox.showinfo("Resultado", "No se han encontrado archivos de video para procesar.")
         estructura_actual.clear()
         for i in tree.get_children():
             tree.delete(i)
         btn_confirmar.config(state='disabled')
-        return
-
-    populate_treeview(tree, struct)
-    estructura_actual.clear()
-    estructura_actual.update(struct)
-    btn_confirmar.config(state='normal')
+    else:
+        populate_treeview(tree, struct)
+        estructura_actual.clear()
+        estructura_actual.update(struct)
+        btn_confirmar.config(state='normal')
+    btn_analizar.config(state='normal')
 
 def elegir_carpeta_origen():
     ruta = filedialog.askdirectory()
@@ -180,54 +223,88 @@ def confirmar():
         messagebox.showerror("Error", "Por favor seleccione una carpeta de destino válida")
         return
     carpeta = carpeta_var.get()
-    standardize_filenames(carpeta, estructura_actual, destino, progress_var, progress_bar, root)
+
+    btn_analizar.config(state='disabled')
+    btn_confirmar.config(state='disabled')
+
+    def on_complete(errors):
+        if errors:
+            msg = "\n".join(errors)
+            messagebox.showerror("Errores durante la operación", msg)
+        else:
+            messagebox.showinfo("Completado", "Los cambios han sido aplicados.")
+        btn_analizar.config(state='normal')
+        for i in tree.get_children():
+            tree.delete(i)
+        estructura_actual.clear()
+        btn_confirmar.config(state='disabled')
+        progress_var.set(0)
+
+    standardize_filenames(carpeta, estructura_actual, destino, progress_var, progress_bar, root, on_complete)
 
 
-# Rutas por defecto
-current_folder = r"C:\Users\david\Downloads\Torrent"
-destination_folder = r'\\Nas\nas'
+if __name__ == "__main__":
+    # Usar rutas con doble barra invertida en Windows
+    current_folder = "C:\\Users\\david\\Downloads\\Torrent"
+    destination_folder = "\\\\Nas\\nas"
 
-root = tk.Tk()
-root.title("Organizador de archivos multimedia")
+    # Comprobar carpeta origen
+    if not os.path.isdir(current_folder):
+        try:
+            os.makedirs(current_folder, exist_ok=True)
+        except Exception as e:
+            print(f"No se pudo crear la carpeta origen {current_folder}: {e}")
+            raise SystemExit
 
-carpeta_var = tk.StringVar(value=current_folder)
-destino_var = tk.StringVar(value=destination_folder)
-estructura_actual = {}
+    # Comprobar carpeta destino
+    if not os.path.isdir(destination_folder):
+        try:
+            os.makedirs(destination_folder, exist_ok=True)
+        except Exception as e:
+            print(f"No se pudo crear la carpeta destino {destination_folder}: {e}")
 
-frame_input = ttk.Frame(root)
-frame_input.pack(padx=10, pady=10, fill='x')
+    root = tk.Tk()
+    root.title("Organizador de archivos multimedia")
 
-ttk.Label(frame_input, text="Carpeta Origen:").pack(anchor='w')
-entry_carpeta = ttk.Entry(frame_input, textvariable=carpeta_var, width=50)
-entry_carpeta.pack(side='left', padx=5, pady=5)
-ttk.Button(frame_input, text="Seleccionar", command=elegir_carpeta_origen).pack(side='left', padx=5, pady=5)
+    carpeta_var = tk.StringVar(value=current_folder)
+    destino_var = tk.StringVar(value=destination_folder)
+    estructura_actual = {}
 
-frame_destino = ttk.Frame(root)
-frame_destino.pack(padx=10, pady=10, fill='x')
+    frame_input = ttk.Frame(root)
+    frame_input.pack(padx=10, pady=10, fill='x')
 
-ttk.Label(frame_destino, text="Carpeta Destino:").pack(anchor='w')
-entry_destino = ttk.Entry(frame_destino, textvariable=destino_var, width=50)
-entry_destino.pack(side='left', padx=5, pady=5)
-ttk.Button(frame_destino, text="Seleccionar", command=elegir_carpeta_destino).pack(side='left', padx=5, pady=5)
+    ttk.Label(frame_input, text="Carpeta Origen:").pack(anchor='w')
+    entry_carpeta = ttk.Entry(frame_input, textvariable=carpeta_var, width=50)
+    entry_carpeta.pack(side='left', padx=5, pady=5)
+    ttk.Button(frame_input, text="Seleccionar", command=elegir_carpeta_origen).pack(side='left', padx=5, pady=5)
 
-frame_buttons = ttk.Frame(root)
-frame_buttons.pack(padx=10, pady=10, fill='x')
+    frame_destino = ttk.Frame(root)
+    frame_destino.pack(padx=10, pady=10, fill='x')
 
-ttk.Button(frame_buttons, text="Analizar Estructura", command=analizar_carpeta).pack(side='left', padx=5)
-btn_confirmar = ttk.Button(frame_buttons, text="Confirmar y Mover", command=confirmar)
-btn_confirmar.pack(side='left', padx=5)
-btn_confirmar.config(state='disabled')
+    ttk.Label(frame_destino, text="Carpeta Destino:").pack(anchor='w')
+    entry_destino = ttk.Entry(frame_destino, textvariable=destino_var, width=50)
+    entry_destino.pack(side='left', padx=5, pady=5)
+    ttk.Button(frame_destino, text="Seleccionar", command=elegir_carpeta_destino).pack(side='left', padx=5, pady=5)
 
-frame_tree = ttk.Frame(root)
-frame_tree.pack(padx=10, pady=10, fill='both', expand=True)
+    frame_buttons = ttk.Frame(root)
+    frame_buttons.pack(padx=10, pady=10, fill='x')
 
-tree = ttk.Treeview(frame_tree, columns=('name',), show='tree')
-tree.pack(fill='both', expand=True)
+    btn_analizar = ttk.Button(frame_buttons, text="Analizar Estructura", command=analizar_carpeta)
+    btn_analizar.pack(side='left', padx=5)
+    btn_confirmar = ttk.Button(frame_buttons, text="Confirmar y Mover", command=confirmar)
+    btn_confirmar.pack(side='left', padx=5)
+    btn_confirmar.config(state='disabled')
 
-frame_progress = ttk.Frame(root)
-frame_progress.pack(padx=10, pady=10, fill='x')
-progress_var = tk.IntVar()
-progress_bar = ttk.Progressbar(frame_progress, variable=progress_var, orient='horizontal', mode='determinate')
-progress_bar.pack(fill='x', expand=True, padx=5, pady=5)
+    frame_tree = ttk.Frame(root)
+    frame_tree.pack(padx=10, pady=10, fill='both', expand=True)
 
-root.mainloop()
+    tree = ttk.Treeview(frame_tree, columns=('name',), show='tree')
+    tree.pack(fill='both', expand=True)
+
+    frame_progress = ttk.Frame(root)
+    frame_progress.pack(padx=10, pady=10, fill='x')
+    progress_var = tk.IntVar()
+    progress_bar = ttk.Progressbar(frame_progress, variable=progress_var, orient='horizontal', mode='determinate')
+    progress_bar.pack(fill='x', expand=True, padx=5, pady=5)
+
+    root.mainloop()
