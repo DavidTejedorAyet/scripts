@@ -36,6 +36,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Callable, List, Optional, DefaultDict
 from collections import defaultdict
 
+__display_name__ = "Reubicar descargas"
+
 # ---------- Dependencias opcionales ----------
 PTN = None
 guessit = None
@@ -587,7 +589,7 @@ class App(tk.Tk):
         # Botones
         frm_buttons = ttk.Frame(self); frm_buttons.pack(fill="x", padx=10, pady=5)
         self.btn_analyze = ttk.Button(frm_buttons, text="Analizar estructura", command=self.on_analyze); self.btn_analyze.pack(side="left", padx=5)
-        self.btn_apply = ttk.Button(frm_buttons, text="Analizar y mover", command=self.on_apply, state="disabled"); self.btn_apply.pack(side="left", padx=5)
+        self.btn_apply = ttk.Button(frm_buttons, text="Mover", command=self.on_apply, state="disabled"); self.btn_apply.pack(side="left", padx=5)
 
         # Árbol
         frm_tree = ttk.Frame(self); frm_tree.pack(fill="both", expand=True, padx=10, pady=10)
@@ -844,10 +846,27 @@ class App(tk.Tk):
 
     def _on_tree_click(self, event):
         row = self.tree.identify_row(event.y)
+        if not row:
+            return  # click fuera de items
+
         col = self.tree.identify_column(event.x)
-        if row and col == "#0":
+        elem = self.tree.identify("element", event.x, event.y) or ""
+
+        # 1) Si fue sobre el indicador (+/-), dejamos que Tk maneje expandir/colapsar
+        #    (algunos temas usan 'Treeitem.indicator' y otros 'Treeitem.button')
+        if elem.endswith("indicator") or elem.endswith("button"):
+            return
+
+        # 2) Si se clicó en cualquier parte de la columna #0 (texto/imagen/padding),
+        #    alternamos el checkbox del nodo
+        if col == "#0":
             self._toggle_node(row)
-            return "break"
+            return "break"  # consumimos el evento para no cambiar selección
+
+        # 3) En otros casos, no hacemos nada especial
+        return
+
+
 
     def _has_any_leaf_selected(self) -> bool:
         for nid, kind in self.node_kind.items():
