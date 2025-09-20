@@ -4,7 +4,7 @@ GUI para buscar y descargar .torrent desde una web dada.
 - Modo "URL": si pegas una ficha (/pelicula/ o /serie/) extrae .torrent; si pegas una búsqueda (/buscar/...) lista resultados (con paginación) para elegir.
 - Modo "Nombre": resuelve el proxy desde donproxies.com y hace la búsqueda -> lista resultados (con paginación) -> eliges uno -> extrae .torrent.
 - Anti-bloqueo de /buscar: precalienta sesión con /tor y usa Referer adecuado.
-- Resultados muestran: (icono) Tipo - Título (Año) - Calidad. Ej.: "🎬 Película - El gran dictador (1940) - BluRay-1080p"
+- Resultados en tabla (Treeview): columnas Tipo (icono), Título, Año, Calidad. El año se completa en segundo plano abriendo la ficha.
 - Lista de enlaces .torrent con checkboxes (marcados por defecto).
 - Carpeta de destino por defecto: \\NAS\\nas\\Descargas\\.torrent
 - Descarga con barra de progreso general.
@@ -20,6 +20,7 @@ import time
 import threading
 import queue
 import traceback
+import itertools
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from urllib.parse import urljoin, urlparse, quote
@@ -96,287 +97,8 @@ def extract_torrent_links(soup: BeautifulSoup, base_url: str):
             seen.add(l)
     return unique
 
-def gather_torrent_links(url: str, log_cb=None, save_html_dir: str | None = None):
-    """
-    Carga una ficha y devuelve la lista de URLs .torrent presentes.
-    (Repare NameError: esta función faltaba en la versión anterior).
-    """
-    soup, err = fetch_soup(url, log_cb=log_cb, save_html_dir=save_html_dir, tag="ficha", referer=None)
-    if err or soup is None:
-        return [], err or "No se pudo cargar la ficha"
-    torrents = extract_torrent_links(soup, url)
-    return torrents, None
-
-# ------------------ Scraping: resultados de búsqueda ------------------ #
-
-ONCLICK_URL_RE = re.compile(r"""location\.href\s*=\s*['"]([^'"]+)['"]""", re.I)
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-
-QUALITY_HINTS = [
-    "1080p", "2160p", "720p", "480p", "4k", "uhd", "hdr", "hdr10", "dolby",
-    "bluray", "bdrip", "brrip", "microhd", "webrip", "web-dl", "webdl", "web",
-    "hdtv", "dvdrip", "dvdr", "cam", "ts", "hdrip", "limitada", "remux"
-]
-
-def _derive_meta_from_anchor(a: BeautifulSoup):
-    """
-    Dada una <a> candidata, intenta derivar:
-    - title_text: texto del enlace sin calidades [..]
-    - type_label: 'Serie' / 'Película' si aparece en un badge del <p> contenedor
-    - quality: texto entre paréntesis o [corchetes] cercano (e.g., (HDTV-720p) o [1080p])
-    - year: año si aparece en el mismo <p> o en el propio texto
-    """
-    title_text_raw = a.get_text(" ", strip=True) or ""
-    # quita [ ... ] del título
-    title_text = re.sub(r"\s*\[[^\]]+\]\s*", " ", title_text_raw).strip()
-
-    type_label = None
-    quality = None
-    year = None
-
-    p = a.find_parent("p")
-    if p:
-        # badge "Serie"/"Película"
-        for b in p.find_all("span", class_=re.compile("badge", re.I)):
-            t = (b.get_text(strip=True) or "").strip()
-            if t:
-                type_label = t
-                break
-        # calidad en paréntesis o corchetes
-        text_candidates = []
-        for sp in p.find_all("span"):
-            t = sp.get_text(" ", strip=True) or ""
-            if t:
-                text_candidates.append(t)
-        text_candidates.append(title_text_raw)
-
-        # busca quality: heurística -> frase que contenga hints típicos
-        for t in text_candidates:
-            # ( ... )
-            m1 = re.search(r"\(([^)]+)\)", t)
-            if m1 and any(h in m1.group(1).lower() for h in QUALITY_HINTS):
-                quality = m1.group(1).strip()
-                break
-            # [ ... ]
-            m2 = re.search(r"\[([^\]]+)\]", t)
-            if m2 and any(h in m2.group(1).lower() for h in QUALITY_HINTS):
-                quality = m2.group(1).strip()
-                break
-
-        # año
-        joined = " ".join(text_candidates)
-        ym = YEAR_RE.search(joined)
-        if ym:
-            year = ym.group(0)
-
-    # fallback año/calidad en el propio título si no hubo <p>
-    if year is None:
-        ym = YEAR_RE.search(title_text_raw)
-        if ym:
-            year = ym.group(0)
-    if quality is None:
-        m2 = re.search(r"\[([^\]]+)\]", title_text_raw)
-        if m2 and any(h in m2.group(1).lower() for h in QUALITY_HINTS):
-            quality = m2.group(1).strip()
-
-    return title_text, type_label, year, quality
-
-def _format_display_title(title_text, type_label, year, quality, url: str):
-    # icono por tipo o por URL
-    icon = "📺" if (type_label and "serie" in type_label.lower()) or "/serie/" in url else "🎬"
-    kind = ("Serie" if (type_label and "serie" in type_label.lower()) or "/serie/" in url else "Película")
-    parts = [f"{icon} {kind} -", title_text]
-    if year:
-        parts.append(f"({year})")
-    if quality:
-        parts.append(f"- {quality}")
-    return " ".join(parts)
-
-def parse_search_results(soup: BeautifulSoup, base_url: str, log_cb=None):
-    """
-    Devuelve una lista de dicts:
-      { 'display': str, 'url': str, 'title': str, 'type': 'Serie'|'Película'|None, 'year': str|None, 'quality': str|None }
-    Heurísticas: patrón <p> con <a>, anchors genéricos, data-href/url, onclick, y fallback conservador.
-    """
-    items = []
-    seen = set()
-    scanned = 0
-    r1 = r2 = r3 = r4 = r5 = 0
-
-    # R1: patrón típico en <p> (tu ejemplo)
-    for p in soup.find_all("p"):
-        a = p.find("a", href=True)
-        if not a:
-            continue
-        href = a["href"]
-        if "/pelicula/" in href or "/serie/" in href:
-            full = urljoin(base_url, href)
-            title_text, type_label, year, quality = _derive_meta_from_anchor(a)
-            display_title = _format_display_title(title_text, type_label, year, quality, full)
-            if full not in seen:
-                seen.add(full)
-                kind = "Serie" if (type_label and "serie" in type_label.lower()) or "/serie/" in full else "Película"
-                items.append({
-                    "display": display_title,
-                    "url": full,
-                    "title": title_text,
-                    "type": kind,
-                    "year": year,
-                    "quality": quality
-                })
-                r1 += 1
-
-    # R2: anchors genéricos
-    for a in soup.find_all("a", href=True):
-        scanned += 1
-        href = a["href"]
-        if "/pelicula/" in href or "/serie/" in href:
-            full = urljoin(base_url, href)
-            if full in seen:
-                continue
-            title_text, type_label, year, quality = _derive_meta_from_anchor(a)
-            display_title = _format_display_title(title_text, type_label, year, quality, full)
-            seen.add(full)
-            kind = "Serie" if (type_label and "serie" in type_label.lower()) or "/serie/" in full else "Película"
-            items.append({
-                "display": display_title,
-                "url": full,
-                "title": title_text,
-                "type": kind,
-                "year": year,
-                "quality": quality
-            })
-            r2 += 1
-
-    # R3: data-href / data-url
-    for tag in soup.select("[data-href],[data-url]"):
-        href = tag.get("data-href") or tag.get("data-url")
-        if not href:
-            continue
-        if "/pelicula/" in href or "/serie/" in href:
-            full = urljoin(base_url, href)
-            if full in seen:
-                continue
-            t = tag.get_text(strip=True) or full
-            # Intentar derivar meta con heurística mínima
-            title_text, type_label, year, quality = (t, None, None, None)
-            display_title = _format_display_title(title_text, type_label, year, quality, full)
-            seen.add(full)
-            kind = "Serie" if "/serie/" in full else "Película"
-            items.append({
-                "display": display_title,
-                "url": full,
-                "title": title_text,
-                "type": kind,
-                "year": year,
-                "quality": quality
-            })
-            r3 += 1
-
-    # R4: onclick location.href
-    for tag in soup.find_all(onclick=True):
-        oc = tag.get("onclick") or ""
-        m = ONCLICK_URL_RE.search(oc)
-        if not m:
-            continue
-        href = m.group(1)
-        if "/pelicula/" in href or "/serie/" in href:
-            full = urljoin(base_url, href)
-            if full in seen:
-                continue
-            t = tag.get_text(strip=True) or full
-            title_text, type_label, year, quality = (t, None, None, None)
-            display_title = _format_display_title(title_text, type_label, year, quality, full)
-            seen.add(full)
-            kind = "Serie" if "/serie/" in full else "Película"
-            items.append({
-                "display": display_title,
-                "url": full,
-                "title": title_text,
-                "type": kind,
-                "year": year,
-                "quality": quality
-            })
-            r4 += 1
-
-    # R5: fallback conservador
-    if not items:
-        base_host = urlparse(base_url).netloc
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            full = urljoin(base_url, href)
-            host = urlparse(full).netloc
-            if host != base_host:
-                continue
-            if any(seg in href for seg in ("/buscar/", "/torrents/", "/categoria/", "/genero/", "/page/", "/contacto", "/acerca", "/terminos")):
-                continue
-            if re.search(r"/\d{3,}/", href):
-                if full in seen:
-                    continue
-                t = a.get_text(strip=True) or full
-                title_text, type_label, year, quality = (t, None, None, None)
-                display_title = _format_display_title(title_text, type_label, year, quality, full)
-                seen.add(full)
-                kind = "Serie" if "/serie/" in full else "Película"
-                items.append({
-                    "display": display_title,
-                    "url": full,
-                    "title": title_text,
-                    "type": kind,
-                    "year": year,
-                    "quality": quality
-                })
-                r5 += 1
-
-    if log_cb:
-        log_cb(f"[parse_search_results] Inspeccionados={scanned} | R1={r1} R2={r2} R3={r3} R4={r4} R5={r5} | Total={len(items)}")
-    return items
-
-# ------------------ Paginación de /buscar/ ------------------ #
-
-PAGE_NUM_RE = re.compile(r"/page/(\d+)", re.I)
-
-def enumerate_search_pages(first_url: str, soup: BeautifulSoup, log_cb=None):
-    """
-    Devuelve la lista de URLs de páginas de búsqueda a visitar (incluyendo la primera),
-    basándose en el 'page-navigator' y sus 'a.page-link'.
-    """
-    pages = set([first_url])
-    nav = None
-
-    for c in ["page-navigator", "pagination", "pager"]:
-        nav = soup.find(class_=re.compile(c, re.I))
-        if nav:
-            break
-
-    links = []
-    if nav:
-        candidates = nav.find_all("a", href=True)
-        for a in candidates:
-            cls = " ".join(a.get("class", [])) if a.has_attr("class") else ""
-            if ("page-link" in cls) or True:
-                href = a["href"]
-                if href:
-                    full = urljoin(first_url, href)
-                    links.append(full)
-
-    for u in links:
-        pages.add(u)
-
-    def page_key(u):
-        m = PAGE_NUM_RE.search(u)
-        return int(m.group(1)) if m else (0 if u.rstrip("/").endswith("/buscar") else 1)
-
-    ordered = sorted(pages, key=page_key)
-    if log_cb:
-        log_cb(f"[PAGINATION] page-link detectados={len(links)} | páginas únicas={len(ordered)}")
-        if len(ordered) > 1:
-            log_cb("[PAGINATION] Páginas: " + " , ".join(ordered))
-    return ordered
-
-# ------------------ HTTP helpers (con Referer) ------------------ #
-
 def fetch_soup(url: str, log_cb=None, save_html_dir: str | None = None, tag: str = "page", referer: str | None = None):
+    """GET -> BeautifulSoup con guardado opcional del HTML; acepta Referer."""
     try:
         if log_cb:
             log_cb(f"[HTTP] GET {url} {'(with Referer)' if referer else ''}")
@@ -410,6 +132,305 @@ def fetch_soup(url: str, log_cb=None, save_html_dir: str | None = None, tag: str
             log_cb(traceback.format_exc())
         return None, f"Error al acceder a {url}: {e}"
 
+def gather_torrent_links(url: str, log_cb=None, save_html_dir: str | None = None):
+    """Carga una ficha y devuelve la lista de URLs .torrent presentes."""
+    soup, err = fetch_soup(url, log_cb=log_cb, save_html_dir=save_html_dir, tag="ficha", referer=None)
+    if err or soup is None:
+        return [], err or "No se pudo cargar la ficha"
+    torrents = extract_torrent_links(soup, url)
+    return torrents, None
+
+# ------------------ Scraping: resultados de búsqueda ------------------ #
+
+ONCLICK_URL_RE = re.compile(r"""location\.href\s*=\s*['"]([^'"]+)['"]""", re.I)
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+QUALITY_HINTS = [
+    "1080p", "2160p", "720p", "480p", "4k", "uhd", "hdr", "hdr10", "dolby",
+    "bluray", "bdrip", "brrip", "microhd", "webrip", "web-dl", "webdl", "web",
+    "hdtv", "dvdrip", "dvdr", "cam", "ts", "hdrip", "limitada", "remux"
+]
+
+def _find_year_near_anchor(a: BeautifulSoup):
+    """Busca el año en <p> hermanos cercanos con etiqueta 'Año:' o 'Anyo' y en onclicks 'campo: anyo'."""
+    p = a.find_parent("p")
+    siblings = []
+    if p:
+        prevs = list(p.find_previous_siblings("p", limit=4))
+        nexts = list(p.find_next_siblings("p", limit=4))
+        siblings = prevs + nexts
+    # Si no hay <p>, intenta con el padre directo
+    if not siblings and a.parent:
+        for sib in itertools.islice(a.parent.find_all("p"), 8):
+            siblings.append(sib)
+    for sib in siblings:
+        b = sib.find(["b", "strong"])
+        if b and any(x in (b.get_text(strip=True) or "").lower() for x in ("año", "anyo")):
+            m = YEAR_RE.search(sib.get_text(" ", strip=True))
+            if m:
+                return m.group(0)
+        if sib.has_attr("onclick"):
+            oc = sib.get("onclick") or ""
+            m = re.search(r"campo\s*:\s*'anyo'\s*,\s*valor\s*:\s*'(\d{4})'", oc, re.I)
+            if m:
+                return m.group(1)
+    # onclicks en ancestros
+    for t in [a] + list(a.parents):
+        if hasattr(t, "get"):
+            oc = t.get("onclick") or ""
+            if oc:
+                m = re.search(r"campo\s*:\s*'anyo'\s*,\s*valor\s*:\s*'(\d{4})'", oc, re.I)
+                if m:
+                    return m.group(1)
+    return None
+
+def _derive_meta_from_anchor(a: BeautifulSoup):
+    """Meta: título (limpio), tipo, año (si se ve cerca), calidad (si aparece)."""
+    title_text_raw = a.get_text(" ", strip=True) or ""
+    title_text = re.sub(r"\s*\[[^\]]+\]\s*", " ", title_text_raw).strip()
+
+    type_label = None
+    quality = None
+    year = None
+
+    p = a.find_parent("p")
+    if p:
+        # badge "Serie"/"Película"
+        for b in p.find_all("span", class_=re.compile("badge", re.I)):
+            t = (b.get_text(strip=True) or "").strip()
+            if t:
+                type_label = t
+                break
+        # calidad en paréntesis o corchetes
+        text_candidates = []
+        for sp in p.find_all("span"):
+            t = sp.get_text(" ", strip=True) or ""
+            if t:
+                text_candidates.append(t)
+        text_candidates.append(title_text_raw)
+
+        for t in text_candidates:
+            m1 = re.search(r"\(([^)]+)\)", t)
+            if m1 and any(h in m1.group(1).lower() for h in QUALITY_HINTS):
+                quality = m1.group(1).strip()
+                break
+            m2 = re.search(r"\[([^\]]+)\]", t)
+            if m2 and any(h in m2.group(1).lower() for h in QUALITY_HINTS):
+                quality = m2.group(1).strip()
+                break
+
+        # año si aparece
+        joined = " ".join(text_candidates)
+        ym = YEAR_RE.search(joined)
+        if ym:
+            year = ym.group(0)
+
+    if year is None:
+        year = _find_year_near_anchor(a)
+
+    if year is None:
+        ym = YEAR_RE.search(title_text_raw)
+        if ym:
+            year = ym.group(0)
+    if quality is None:
+        m2 = re.search(r"\[([^\]]+)\]", title_text_raw)
+        if m2 and any(h in m2.group(1).lower() for h in QUALITY_HINTS):
+            quality = m2.group(1).strip()
+
+    return title_text, type_label, year, quality
+
+def _format_display_title(title_text, type_label, year, quality, url: str):
+    icon = "📺" if (type_label and "serie" in type_label.lower()) or "/serie/" in url else "🎬"
+    kind = ("Serie" if (type_label and "serie" in type_label.lower()) or "/serie/" in url else "Película")
+    parts = [f"{icon} {kind} -", title_text]
+    if year:
+        parts.append(f"({year})")
+    if quality:
+        parts.append(f"- {quality}")
+    return " ".join(parts), icon, kind
+
+def parse_search_results(soup: BeautifulSoup, base_url: str, log_cb=None):
+    """
+    Devuelve lista de dicts:
+      { 'display', 'url', 'title', 'type', 'year', 'quality', 'icon' }
+    """
+    items = []
+    seen = set()
+    scanned = 0
+    r1 = r2 = r3 = r4 = r5 = 0
+
+    # R1: <p> con <a> a /pelicula/ o /serie/
+    for p in soup.find_all("p"):
+        a = p.find("a", href=True)
+        if not a:
+            continue
+        href = a["href"]
+        if "/pelicula/" in href or "/serie/" in href:
+            full = urljoin(base_url, href)
+            title_text, type_label, year, quality = _derive_meta_from_anchor(a)
+            display_title, icon, kind = _format_display_title(title_text, type_label, year, quality, full)
+            if full not in seen:
+                seen.add(full)
+                items.append({
+                    "display": display_title,
+                    "url": full,
+                    "title": title_text,
+                    "type": kind,
+                    "year": year,
+                    "quality": quality,
+                    "icon": icon
+                })
+                r1 += 1
+
+    # R2: anchors genéricos
+    for a in soup.find_all("a", href=True):
+        scanned += 1
+        href = a["href"]
+        if "/pelicula/" in href or "/serie/" in href:
+            full = urljoin(base_url, href)
+            if full in seen:
+                continue
+            title_text, type_label, year, quality = _derive_meta_from_anchor(a)
+            display_title, icon, kind = _format_display_title(title_text, type_label, year, quality, full)
+            seen.add(full)
+            items.append({
+                "display": display_title,
+                "url": full,
+                "title": title_text,
+                "type": kind,
+                "year": year,
+                "quality": quality,
+                "icon": icon
+            })
+            r2 += 1
+
+    # R3: data-href / data-url
+    for tag in soup.select("[data-href],[data-url]"):
+        href = tag.get("data-href") or tag.get("data-url")
+        if not href:
+            continue
+        if "/pelicula/" in href or "/serie/" in href:
+            full = urljoin(base_url, href)
+            if full in seen:
+                continue
+            t = tag.get_text(strip=True) or full
+            title_text, type_label, year, quality = (t, None, None, None)
+            year = year or _find_year_near_anchor(tag)
+            display_title, icon, kind = _format_display_title(title_text, type_label, year, quality, full)
+            seen.add(full)
+            items.append({
+                "display": display_title,
+                "url": full,
+                "title": title_text,
+                "type": kind,
+                "year": year,
+                "quality": quality,
+                "icon": icon
+            })
+            r3 += 1
+
+    # R4: onclick location.href
+    for tag in soup.find_all(onclick=True):
+        oc = tag.get("onclick") or ""
+        m = ONCLICK_URL_RE.search(oc)
+        if not m:
+            continue
+        href = m.group(1)
+        if "/pelicula/" in href or "/serie/" in href:
+            full = urljoin(base_url, href)
+            if full in seen:
+                continue
+            t = tag.get_text(strip=True) or full
+            title_text, type_label, year, quality = (t, None, None, None)
+            year = year or _find_year_near_anchor(tag)
+            display_title, icon, kind = _format_display_title(title_text, type_label, year, quality, full)
+            seen.add(full)
+            items.append({
+                "display": display_title,
+                "url": full,
+                "title": title_text,
+                "type": kind,
+                "year": year,
+                "quality": quality,
+                "icon": icon
+            })
+            r4 += 1
+
+    # R5: fallback conservador
+    if not items:
+        base_host = urlparse(base_url).netloc
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            full = urljoin(base_url, href)
+            host = urlparse(full).netloc
+            if host != base_host:
+                continue
+            if any(seg in href for seg in ("/buscar/", "/torrents/", "/categoria/", "/genero/", "/page/", "/contacto", "/acerca", "/terminos")):
+                continue
+            if re.search(r"/\d{3,}/", href):
+                if full in seen:
+                    continue
+                t = a.get_text(strip=True) or full
+                title_text, type_label, year, quality = (t, None, None, None)
+                year = year or _find_year_near_anchor(a)
+                display_title, icon, kind = _format_display_title(title_text, type_label, year, quality, full)
+                seen.add(full)
+                items.append({
+                    "display": display_title,
+                    "url": full,
+                    "title": title_text,
+                    "type": kind,
+                    "year": year,
+                    "quality": quality,
+                    "icon": icon
+                })
+                r5 += 1
+
+    if log_cb:
+        log_cb(f"[parse_search_results] Inspeccionados={scanned} | R1={r1} R2={r2} R3={r3} R4={r4} R5={r5} | Total={len(items)}")
+    return items
+
+# ------------------ Paginación de /buscar/ ------------------ #
+
+PAGE_NUM_RE = re.compile(r"/page/(\d+)", re.I)
+
+def enumerate_search_pages(first_url: str, soup: BeautifulSoup, log_cb=None):
+    """Lista de URLs de todas las páginas de resultados (incluye la primera)."""
+    pages = set([first_url])
+    nav = None
+
+    for c in ["page-navigator", "pagination", "pager"]:
+        nav = soup.find(class_=re.compile(c, re.I))
+        if nav:
+            break
+
+    links = []
+    if nav:
+        candidates = nav.find_all("a", href=True)
+        for a in candidates:
+            cls = " ".join(a.get("class", [])) if a.has_attr("class") else ""
+            if ("page-link" in cls) or True:
+                href = a["href"]
+                if href:
+                    full = urljoin(first_url, href)
+                    links.append(full)
+
+    for u in links:
+        pages.add(u)
+
+    def page_key(u):
+        m = PAGE_NUM_RE.search(u)
+        return int(m.group(1)) if m else (0 if u.rstrip("/").endswith("/buscar") else 1)
+
+    ordered = sorted(pages, key=page_key)
+    if log_cb:
+        log_cb(f"[PAGINATION] page-link detectados={len(links)} | páginas únicas={len(ordered)}")
+        if len(ordered) > 1:
+            log_cb("[PAGINATION] Páginas: " + " , ".join(ordered))
+    return ordered
+
+# ------------------ Anti-bloqueo / helpers de búsqueda ------------------ #
+
 def warmup_tor(host: str, log_cb=None, save_html_dir: str | None = None):
     """Precalienta sesión visitando /tor para que el buscador acepte /buscar/."""
     tor_url = f"https://{host}/tor"
@@ -424,11 +445,7 @@ def page_contains_use_search_message(soup: BeautifulSoup) -> bool:
     return "necesitas utilizar el buscador" in txt
 
 def collect_search_results_from_url(search_url: str, log_cb=None, save_html_dir: str | None = None, force_host: str | None = None):
-    """
-    Carga la URL de búsqueda (y sus páginas) y agrega todos los resultados.
-    Incluye lógica anti-bloqueo: reintenta con Referer /tor si detecta bloqueo.
-    Devuelve lista de dicts (ver parse_search_results).
-    """
+    """Carga la búsqueda y sus páginas; devuelve lista de dicts de resultados."""
     # Primer intento directo
     soup, err = fetch_soup(search_url, log_cb=log_cb, save_html_dir=save_html_dir, tag="busqueda_p1", referer=None)
     if err or soup is None:
@@ -488,13 +505,7 @@ def collect_search_results_from_url(search_url: str, log_cb=None, save_html_dir:
 # ------------------ Resolver proxy + búsqueda por nombre ------------------ #
 
 def resolve_proxy_host(log_cb=None, save_html_dir: str | None = None):
-    """
-    Obtiene el host del proxy desde https://donproxies.com/#proxy
-    Heurísticas:
-      1) Anchor cuyo texto contenga 'Ingresar' y 'Proxy' (o 'Prxy').
-      2) Anchors a dominios con '.mirror.' o '-don.'.
-      3) URLs en <script> con esos patrones.
-    """
+    """Obtiene el host del proxy desde donproxies.com."""
     url = "https://donproxies.com/#proxy"
     soup, err = fetch_soup(url, log_cb=log_cb, save_html_dir=save_html_dir, tag="donproxies_hash")
     if err or soup is None:
@@ -538,11 +549,7 @@ def resolve_proxy_host(log_cb=None, save_html_dir: str | None = None):
     return None, "No se pudo resolver un proxy válido desde donproxies.com (¿contenido dinámico por JS?)"
 
 def search_by_name(query: str, manual_host: str | None, log_cb=None, save_html_dir: str | None = None):
-    """
-    Si manual_host está definido, se usa directamente.
-    Si no, resuelve el proxy y realiza la búsqueda con paginación y anti-bloqueo.
-    Devuelve lista de dicts (ver parse_search_results).
-    """
+    """Busca por nombre (resolviendo proxy si hace falta)."""
     if manual_host:
         host = manual_host.strip().replace("https://", "").replace("http://", "").rstrip("/")
         if log_cb:
@@ -555,6 +562,61 @@ def search_by_name(query: str, manual_host: str | None, log_cb=None, save_html_d
     warmup_tor(host, log_cb=log_cb, save_html_dir=save_html_dir)
     first_url = f"https://{host}/buscar/{quote(query, safe='')}"
     return collect_search_results_from_url(first_url, log_cb=log_cb, save_html_dir=save_html_dir, force_host=host)
+
+# ------------------ Enriquecimiento: obtener AÑO desde la ficha ------------------ #
+
+def parse_year_from_ficha_soup(soup: BeautifulSoup) -> str | None:
+    """Intenta extraer el año de la ficha con múltiples patrones."""
+    for tag in soup.find_all(["p", "li", "div", "span", "dt", "dd"]):
+        lbl = tag.find(["b", "strong"])
+        if lbl:
+            t = (lbl.get_text(" ", strip=True) or "").lower()
+            if "año" in t or "anyo" in t:
+                m = YEAR_RE.search(tag.get_text(" ", strip=True))
+                if m:
+                    return m.group(0)
+        if tag.has_attr("onclick"):
+            oc = tag.get("onclick") or ""
+            m = re.search(r"campo\s*:\s*'anyo'\s*,\s*valor\s*:\s*'(\d{4})'", oc, re.I)
+            if m:
+                return m.group(1)
+
+    for t in soup.find_all(attrs={"onclick": True}):
+        oc = t.get("onclick") or ""
+        m = re.search(r"campo\s*:\s*'anyo'\s*,\s*valor\s*:\s*'(\d{4})'", oc, re.I)
+        if m:
+            return m.group(1)
+
+    for sel in [
+        ('meta', {'itemprop': 'datePublished'}),
+        ('meta', {'property': 'datePublished'}),
+        ('span', {'itemprop': 'datePublished'}),
+    ]:
+        for tag in soup.find_all(*sel):
+            txt = tag.get('content') or tag.get_text(" ", strip=True) or ""
+            m = YEAR_RE.search(txt)
+            if m:
+                return m.group(0)
+
+    txt = soup.get_text(" ", strip=True)
+    m = re.search(r"[Aa]ñ?yo?\s*[:\-\s]*\b(19|20)\d{2}\b", txt)
+    if m:
+        ym = YEAR_RE.search(m.group(0))
+        if ym:
+            return ym.group(0)
+
+    return None
+
+def fetch_year_from_ficha(url: str, log_cb=None, save_html_dir: str | None = None) -> str | None:
+    soup, err = fetch_soup(url, log_cb=log_cb, save_html_dir=save_html_dir, tag="ficha_for_year", referer=None)
+    if err or soup is None:
+        if log_cb:
+            log_cb(f"[YEAR] No se pudo abrir ficha para año: {err}")
+        return None
+    year = parse_year_from_ficha_soup(soup)
+    if log_cb:
+        log_cb(f"[YEAR] {url} -> {year or 'no encontrado'}")
+    return year
 
 # ------------------ Descarga ------------------ #
 
@@ -633,8 +695,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Buscador/Descargador de Torrents")
-        self.geometry("1000x780")
-        self.minsize(880, 700)
+        self.geometry("1100x820")
+        self.minsize(980, 740)
 
         # Estado
         self.dest_folder = r"\\NAS\nas\Descargas\.torrent"
@@ -648,14 +710,16 @@ class App(tk.Tk):
         self.total_var = tk.IntVar(value=0)
         self.done_var = tk.IntVar(value=0)
 
-        # Resultados de búsqueda (cada item es dict con keys: display, url, title, type, year, quality)
-        self.search_results = []
+        # Resultados de búsqueda
+        self.search_results = []   # lista de dicts
+        self.tree_iid_to_index = {}  # iid -> índice en self.search_results
 
-        # Spinner / “cargando…”
+        # ---------- Loader con recuento ----------
+        self._busy_count = 0
         self._spinner_running = False
         self._spinner_job = None
         self._spinner_idx = 0
-        self._spinner_text = "Cargando"
+        self._busy_text = "Cargando…"
         self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
         # Layout
@@ -680,28 +744,41 @@ class App(tk.Tk):
             pass
         print(line, end="")
 
-    # ---------- Spinner / Loading ---------- #
+    # ---------- Loader (spinner+barra) ---------- #
 
     def _spin_tick(self):
         if not self._spinner_running:
             return
         ch = self._spinner_frames[self._spinner_idx % len(self._spinner_frames)]
         self._spinner_idx += 1
-        self.status_var.set(f"{self._spinner_text} {ch}")
-        self._spinner_job = self.after(100, self._spin_tick)
+        try:
+            self.status_var.set(f"{self._busy_text} {ch}")
+        finally:
+            self._spinner_job = self.after(100, self._spin_tick)
 
     def start_loading(self, text="Cargando…"):
-        self._spinner_text = text
-        self._spinner_running = True
-        self._spinner_idx = 0
-        try:
-            self.progress.configure(mode="indeterminate")
-            self.progress.start(30)
-        except Exception:
-            pass
-        self._spin_tick()
+        """Incrementa contador de tareas y arranca el spinner si pasa de 0 -> 1."""
+        self._busy_count += 1
+        if text:
+            self._busy_text = text
+        if self._busy_count == 1:
+            # Arranca animación
+            self._spinner_running = True
+            self._spinner_idx = 0
+            try:
+                self.progress.configure(mode="indeterminate", value=0)
+                self.progress.start(30)
+            except Exception:
+                pass
+            self._spin_tick()
 
     def stop_loading(self, final_text="Listo."):
+        """Decrementa contador de tareas; si llega a 0, detiene animación y fija estado."""
+        if self._busy_count > 0:
+            self._busy_count -= 1
+        if self._busy_count > 0:
+            # Aún quedan tareas en curso; no paramos
+            return
         self._spinner_running = False
         try:
             if self._spinner_job:
@@ -752,13 +829,22 @@ class App(tk.Tk):
         frm = ttk.LabelFrame(self, text="Resultados de búsqueda", padding=6)
         frm.pack(fill="both", expand=False, padx=10, pady=(6, 0))
 
-        self.results_list = tk.Listbox(frm, height=10)
-        self.results_list.pack(side="left", fill="both", expand=True)
-        self.results_list.bind("<Double-Button-1>", lambda e: self.on_open_selected_result())
+        cols = ("tipo", "titulo", "anio", "calidad")
+        self.results_tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse", height=12)
+        self.results_tree.heading("tipo", text="Tipo")
+        self.results_tree.heading("titulo", text="Título")
+        self.results_tree.heading("anio", text="Año")
+        self.results_tree.heading("calidad", text="Calidad")
+        self.results_tree.column("tipo", width=80, anchor="center")
+        self.results_tree.column("titulo", width=700, anchor="w")
+        self.results_tree.column("anio", width=80, anchor="center")
+        self.results_tree.column("calidad", width=160, anchor="w")
+        self.results_tree.pack(side="left", fill="both", expand=True)
+        self.results_tree.bind("<Double-Button-1>", lambda e: self.on_open_selected_result())
 
-        sb = ttk.Scrollbar(frm, orient="vertical", command=self.results_list.yview)
+        sb = ttk.Scrollbar(frm, orient="vertical", command=self.results_tree.yview)
         sb.pack(side="right", fill="y")
-        self.results_list.configure(yscrollcommand=sb.set)
+        self.results_tree.configure(yscrollcommand=sb.set)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=10, pady=(0, 6))
@@ -829,18 +915,46 @@ class App(tk.Tk):
             self.log("[WARN] No se encontraron enlaces .torrent en la página cargada.")
 
     def populate_search_results(self, results):
-        self.results_list.delete(0, tk.END)
-        self.search_results = results[:]  # copia (lista de dicts)
-        for item in results:
-            self.results_list.insert(tk.END, item["display"])
+        # results: lista de dicts
+        for iid in self.results_tree.get_children():
+            self.results_tree.delete(iid)
+        self.search_results = results[:]  # copia
+        self.tree_iid_to_index.clear()
+        for i, item in enumerate(results):
+            iid = str(i)
+            self.tree_iid_to_index[iid] = i
+            self.results_tree.insert(
+                "", "end", iid=iid,
+                values=(item.get("icon", ""), item.get("title", ""),
+                        item.get("year", "") or "", item.get("quality", "") or "")
+            )
         has = len(results) > 0
         self.open_result_btn.configure(state="normal" if has else "disabled")
         self.clear_results_btn.configure(state="normal" if has else "disabled")
         self.log(f"[RESULT] Items en la lista: {len(results)}")
 
+        # Enriquecer AÑO en segundo plano (si falta)
+        if has:
+            threading.Thread(target=self._enrich_years_async, daemon=True).start()
+
+    def _enrich_years_async(self):
+        self.log("[YEAR] Completando años desde las fichas…")
+        save_dir = "debug_html" if self.save_html_var.get() else None
+        for i, item in enumerate(self.search_results):
+            if item.get("year"):
+                continue
+            year = fetch_year_from_ficha(item["url"], log_cb=self.log, save_html_dir=save_dir)
+            if year:
+                self.search_results[i]["year"] = year
+                iid = str(i)
+                self.after(0, lambda _iid=iid, _year=year: self.results_tree.set(_iid, "anio", _year))
+        self.log("[YEAR] Enriquecimiento finalizado.")
+
     def clear_search_results(self):
-        self.results_list.delete(0, tk.END)
+        for iid in self.results_tree.get_children():
+            self.results_tree.delete(iid)
         self.search_results.clear()
+        self.tree_iid_to_index.clear()
         self.open_result_btn.configure(state="disabled")
         self.clear_results_btn.configure(state="disabled")
         self.log("[UI] Resultados limpiados.")
@@ -899,7 +1013,6 @@ class App(tk.Tk):
                         self.after(0, lambda: self.stop_loading(f"{len(results)} resultados. Elige uno y pulsa 'Cargar selección'."))
                         return
 
-                    # Si es ficha -> extraer torrents directamente
                     links, err = gather_torrent_links(text, log_cb=self.log, save_html_dir=save_dir)
                     if err:
                         self.after(0, lambda s=err: self.log(f"[WARN] {s}"))
@@ -927,12 +1040,13 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def on_open_selected_result(self):
-        idxs = self.results_list.curselection()
-        if not idxs:
+        sel = self.results_tree.selection()
+        if not sel:
             messagebox.showinfo("Selecciona un resultado", "Elige un resultado de la lista primero.")
             return
-        idx = idxs[0]
+        iid = sel[0]
         try:
+            idx = self.tree_iid_to_index[iid]
             item = self.search_results[idx]
             url = item["url"]
             title = item["display"]
