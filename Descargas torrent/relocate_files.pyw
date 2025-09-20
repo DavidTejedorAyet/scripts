@@ -5,10 +5,11 @@ Organizador de archivos multimedia (Películas/Series) con GUI Tkinter.
 
 - Analiza múltiples carpetas de origen (no mueve en el análisis).
 - Ignora subcarpetas que empiezan por punto (".temp", ".cache", etc.) y archivos ocultos (".algo").
-- Detección híbrida con heurística mejorada para SERIES:
-    * Serie = prefijo anterior a SxxEyy o N×M (p.ej. "Cheers_04x05-..." -> "Cheers").
+- Detección híbrida para SERIES:
+    * Serie = prefijo anterior a SxxEyy o N×M (p.ej. "El.Coche.Fantastico.1x01...").
     * Incluye TÍTULO DEL EPISODIO: "Serie - 04x05 - Título.ext".
-    * Si no es claro, intenta deducir la serie de la carpeta padre ("<Serie> - Temporada ...").
+    * Unifica nombres de serie con/ sin acentos y variantes ("El coche fantástico" == "El Coche Fantastico").
+    * El título del episodio se limpia de tokens tipo HDTV/XviD/720p/www..., [tags], etc.
 - Apoyo opcional con PTN (parse-torrent-name) y guessit. Botón para instalarlas.
 - Renombrado:
     Películas/Título (Año).ext
@@ -30,13 +31,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import unicodedata
 import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, List, Optional, DefaultDict
 from collections import defaultdict
-
-__display_name__ = "Reubicar descargas"
 
 # ---------- Dependencias opcionales ----------
 PTN = None
@@ -89,15 +89,27 @@ FALLBACK_NUMBERED_TITLE = re.compile(
 
 # Series: patrones con TÍTULO al inicio
 SERIES_WITH_TITLE = [
-    # "<title> S01E02 ..."
     re.compile(r'^\s*(?P<title>.+?)[\s._\-]*S(?P<s>\d{1,2})E(?P<e>\d{1,3})\b', re.IGNORECASE),
-    # "<title> 01x02 ..." (o 1x2)
     re.compile(r'^\s*(?P<title>.+?)[\s._\-]*(?P<s>\d{1,2})x(?P<e>\d{1,3})\b', re.IGNORECASE),
 ]
 
 # Series: detectores “en cualquier parte”
 PATTERN_SxxEyy = re.compile(r'(?i)(?:^|[^A-Za-z0-9])S(?P<s>\d{1,2})E(?P<e>\d{1,3})(?:[^A-Za-z0-9]|$)')
 PATTERN_NxM = re.compile(r'(?i)(?:^|[^A-Za-z0-9])(?P<s>\d{1,2})x(?P<e>\d{1,3})(?:[^A-Za-z0-9]|$)')
+
+# --- Tokens técnicos/release para limpieza de títulos de episodio ---
+RELEASE_KEYWORDS = {
+    "hdtv", "dvb", "webrip", "webdl", "web-dl", "hdrip", "bdrip", "brrip",
+    "bluray", "bray", "dvdrip", "dvdscr", "screener", "remux",
+    "xvid", "divx", "x264", "x265", "h264", "h265", "hevc",
+    "aac", "ac3", "dts", "mp3", "dual", "multi", "vose", "vos", "subs", "sub", "subesp",
+    "castellano", "esp", "lat", "eng", "espanol", "español",
+    "www", "by", "proper", "repack", "rip", "digital", "microhd", "cam", "ts", "tc"
+}
+RESOLUTION_RE = re.compile(r"^\d{3,4}p$", re.IGNORECASE)
+
+# Canon de nombres de serie (sin acentos/espacios)
+SHOW_CANON_MAP: dict[str, str] = {}
 
 
 # ---------- Utils ----------
@@ -154,13 +166,42 @@ def human_bytes(n: float) -> str:
     return f"{x:.1f} {units[i]}"
 
 
+def strip_release_keywords(s: str) -> str:
+    """Corta a partir de tokens técnicos (HDTV/XviD/720p/www...)."""
+    if not s:
+        return ""
+    tokens = re.split(r'[\s._\-\[\]\(\)]+', s)
+    keep = []
+    for tok in tokens:
+        if not tok:
+            continue
+        tl = tok.lower()
+        if (
+            tl in RELEASE_KEYWORDS
+            or RESOLUTION_RE.match(tl)
+            or tl.startswith("www")
+            or tl.endswith(("com", "net", "org"))
+        ):
+            break
+        keep.append(tok)
+    return " ".join(keep)
+
+
 def clean_episode_title(s: str) -> str:
-    """Normaliza el título del episodio."""
+    """
+    Normaliza el título del episodio:
+    - Quita tokens SxxEyy/NxM al inicio/fin.
+    - Limpia [tags]/(tags) finales.
+    - Elimina tokens técnicos (HDTV/XviD/720p/www...).
+    - Homogeneiza separadores y espacios.
+    """
     s = s or ""
+    s = s.replace("_", " ").replace(".", " ")
     s = re.sub(r'^[\s.\-_:–—]+', '', s)
     s = re.sub(r'(?i)^(S?\s*\d{1,2}\s*[xE]\s*\d{1,3})(?:\s*[-_.])?\s*', '', s)
     s = re.sub(r'(?i)\s*(?:[-_.])?\s*(S?\s*\d{1,2}\s*[xE]\s*\d{1,3})\s*$', '', s)
     s = strip_release_tags(s)
+    s = strip_release_keywords(s)
     s = beautify_spaces(s)
     return s
 
@@ -168,6 +209,39 @@ def clean_episode_title(s: str) -> str:
 def ep_title_from_match(cleaned_stem: str, m: re.Match) -> str:
     suffix = cleaned_stem[m.end():]
     return clean_episode_title(suffix)
+
+
+def _slug_noaccents(s: str) -> str:
+    n = unicodedata.normalize("NFD", s)
+    n = "".join(ch for ch in n if unicodedata.category(ch) != "Mn")
+    n = n.lower()
+    n = re.sub(r"[^a-z0-9]+", "", n)
+    return n
+
+
+def canonicalize_show_title(candidate: str) -> str:
+    """Unifica variantes (con/sin acentos/espacios) y conserva la versión más 'bonita'."""
+    cand = sanitize_filename(beautify_spaces(candidate or "")) or "Desconocido"
+    key = _slug_noaccents(cand)
+    if not key:
+        return cand
+    prev = SHOW_CANON_MAP.get(key)
+    if prev is None:
+        SHOW_CANON_MAP[key] = cand
+    else:
+        has_accent_new = any(ord(c) > 127 for c in cand)
+        has_accent_old = any(ord(c) > 127 for c in prev)
+        if (has_accent_new and not has_accent_old) or (len(cand) > len(prev)):
+            SHOW_CANON_MAP[key] = cand
+    return SHOW_CANON_MAP[key]
+
+
+def choose_show_title(*cands: Optional[str]) -> str:
+    """Elige primer candidato no vacío y lo canonicaliza."""
+    for c in cands:
+        if c and c.strip():
+            return canonicalize_show_title(c)
+    return "Desconocido"
 
 
 # --- Helpers para limpieza tras mover ---
@@ -301,7 +375,8 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
             episode = _safe_int(m.group("e"), 1) or 1
             raw_title = m.group("title") or ""
             raw_title = re.split(r"\bTemporada\b", raw_title, maxsplit=1, flags=re.IGNORECASE)[0]
-            show_title = sanitize_filename(beautify_spaces(raw_title)) or guess_show_from_parent_dir(src_path) or "Desconocido"
+            show_title = choose_show_title(raw_title, guess_show_from_parent_dir(src_path), "Desconocido")
+
             ep_title = ep_title_from_match(cleaned_stem, m)
             ep_str = f"{season:02d}x{episode:02d}"
             dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
@@ -316,7 +391,8 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
             season = _safe_int(m.group("s"), 1) or 1
             episode = _safe_int(m.group("e"), 1) or 1
             prefix = re.sub(r"[\s._\-]+$", "", cleaned_stem[: m.start()])
-            show_title = sanitize_filename(beautify_spaces(prefix)) or guess_show_from_parent_dir(src_path) or "Desconocido"
+            show_title = choose_show_title(prefix, guess_show_from_parent_dir(src_path), "Desconocido")
+
             ep_title = ep_title_from_match(cleaned_stem, m)
             ep_str = f"{season:02d}x{episode:02d}"
             dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
@@ -338,9 +414,11 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
                     if mm:
                         tt = mm.group("title")
                         break
-                show_title = sanitize_filename(beautify_spaces(tt)) or guess_show_from_parent_dir(src_path) or "Desconocido"
+                show_title = choose_show_title(tt, guess_show_from_parent_dir(src_path), "Desconocido")
+
                 season = _safe_int(season, 1) or 1
                 episode = _safe_int(episode, 1) or 1
+
                 ep_title = clean_episode_title(
                     info.get("episodeName") or info.get("episode_name") or info.get("episode_title") or ""
                 )
@@ -348,6 +426,7 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
                     m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem)
                     if m_any:
                         ep_title = ep_title_from_match(cleaned_stem, m_any)
+
                 ep_str = f"{season:02d}x{episode:02d}"
                 dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
                 base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
@@ -367,7 +446,8 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
                     if mm:
                         show_title = mm.group("title")
                         break
-                show_title = sanitize_filename(beautify_spaces(show_title)) or guess_show_from_parent_dir(src_path) or "Desconocido"
+                show_title = choose_show_title(show_title, guess_show_from_parent_dir(src_path), "Desconocido")
+
                 season = _safe_int(info.get("season", 1), 1) or 1
                 eps_raw = info.get("episode_list")
                 eps: List[int] = []
@@ -379,11 +459,13 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
                 if not eps:
                     v = _safe_int(info.get("episode", None), None)
                     eps = [v if v is not None else 1]
+
                 ep_title = clean_episode_title(info.get("episode_title") or "")
                 if not ep_title:
                     m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem)
                     if m_any:
                         ep_title = ep_title_from_match(cleaned_stem, m_any)
+
                 ep_str = f"{season:02d}x{eps[0]:02d}" if len(eps) == 1 else f"{season:02d}x{eps[0]:02d}-{eps[-1]:02d}"
                 dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
                 base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
@@ -588,12 +670,15 @@ class App(tk.Tk):
 
         # Botones
         frm_buttons = ttk.Frame(self); frm_buttons.pack(fill="x", padx=10, pady=5)
-        self.btn_analyze = ttk.Button(frm_buttons, text="Analizar estructura", command=self.on_analyze); self.btn_analyze.pack(side="left", padx=5)
-        self.btn_apply = ttk.Button(frm_buttons, text="Mover", command=self.on_apply, state="disabled"); self.btn_apply.pack(side="left", padx=5)
+        self.btn_analyze = ttk.Button(frm_buttons, text="Analizar", command=self.on_analyze)
+        self.btn_analyze.pack(side="left", padx=5)
+        self.btn_apply = ttk.Button(frm_buttons, text="Mover", command=self.on_apply, state="disabled")
+        self.btn_apply.pack(side="left", padx=5)
 
         # Árbol
         frm_tree = ttk.Frame(self); frm_tree.pack(fill="both", expand=True, padx=10, pady=10)
-        self.tree = ttk.Treeview(frm_tree, show="tree"); self.tree.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(frm_tree, show="tree")
+        self.tree.pack(fill="both", expand=True)
 
         # Estados del árbol (checkboxes)
         self._init_tree_state()
@@ -714,7 +799,7 @@ class App(tk.Tk):
                 plan = []; self._ui(lambda m=f"Fallo al analizar: {ex}": messagebox.showerror("Error", m))
             def finish():
                 self.plan = plan
-                self._populate_tree(plan)  # habilita "aplicar" si hay marcados
+                self._populate_tree(plan)  # habilita "Mover" si hay marcados
                 self._set_busy(False); self.status_var.set(f"Análisis completado. Ítems: {len(plan)}")
             self._ui(finish)
         threading.Thread(target=worker, daemon=True).start()
@@ -847,26 +932,16 @@ class App(tk.Tk):
     def _on_tree_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
-            return  # click fuera de items
-
+            return
         col = self.tree.identify_column(event.x)
         elem = self.tree.identify("element", event.x, event.y) or ""
-
-        # 1) Si fue sobre el indicador (+/-), dejamos que Tk maneje expandir/colapsar
-        #    (algunos temas usan 'Treeitem.indicator' y otros 'Treeitem.button')
+        # Si fue sobre el indicador (+/-), deja expandir/colapsar
         if elem.endswith("indicator") or elem.endswith("button"):
             return
-
-        # 2) Si se clicó en cualquier parte de la columna #0 (texto/imagen/padding),
-        #    alternamos el checkbox del nodo
+        # Alterna checkbox si se clica en la columna #0
         if col == "#0":
             self._toggle_node(row)
-            return "break"  # consumimos el evento para no cambiar selección
-
-        # 3) En otros casos, no hacemos nada especial
-        return
-
-
+            return "break"
 
     def _has_any_leaf_selected(self) -> bool:
         for nid, kind in self.node_kind.items():
