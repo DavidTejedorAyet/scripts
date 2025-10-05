@@ -1,0 +1,21 @@
+# Ignorar carpeta de build
+/Mis Scripts (build)/
+
+# Ignorar carpetas de caché de Python
+__pycache__/
+*/__pycache__/
+**/__pycache__/
+
+
+# Ignorar ficheros temporales o de entorno
+*.log
+*.tmp
+*.bak
+
+# Ignorar ficheros de configuración de IDEs
+.vscode/
+.idea/
+
+# Ignorar posibles archivos de sistema
+.DS_Store
+Thumbs.db

@@ -9,6 +9,7 @@ GUI para buscar y descargar .torrent desde una web dada.
 - Carpeta de destino por defecto: \\NAS\\nas\\Descargas\\.torrent
 - Descarga con barra de progreso general.
 - Log con timestamps y opción de guardar HTML (depuración) en una carpeta segura del usuario.
+- Loader VISUAL: diálogo modal con Progressbar indeterminada visible desde pulsar "Buscar" o "Cargar selección" hasta que termina.
 Requisitos: requests, beautifulsoup4
 """
 
@@ -641,6 +642,123 @@ def download_file(url: str, dest_folder: str, progress_cb=None):
         return False, f"Error al descargar {url}: {e}"
     return True, filename
 
+
+# ------------------ Utils: bencode y cálculo de tamaño ------------------ #
+
+def _bdecode(data: bytes, pos: int = 0):
+    """Devuelve (obj, new_pos). Soporta int, bytes, list, dict (claves bytes)."""
+    if data[pos:pos+1] == b'i':
+        end = data.index(b'e', pos)
+        num = int(data[pos+1:end])
+        return num, end + 1
+    if data[pos:pos+1] == b'l':
+        pos += 1
+        lst = []
+        while data[pos:pos+1] != b'e':
+            val, pos = _bdecode(data, pos)
+            lst.append(val)
+        return lst, pos + 1
+    if data[pos:pos+1] == b'd':
+        pos += 1
+        dct = {}
+        while data[pos:pos+1] != b'e':
+            key, pos = _bdecode(data, pos)
+            val, pos = _bdecode(data, pos)
+            dct[key] = val
+        return dct, pos + 1
+    colon = data.index(b':', pos)
+    ln = int(data[pos:colon])
+    start = colon + 1
+    end = start + ln
+    return data[start:end], end
+
+def parse_torrent_total_bytes(fp: str) -> int:
+    """Lee un .torrent y calcula el tamaño total (sumando files[].length o length)."""
+    with open(fp, "rb") as f:
+        data = f.read()
+    obj, _ = _bdecode(data, 0)
+    if not isinstance(obj, dict):
+        return 0
+    info = obj.get(b"info") or {}
+    if b"length" in info:
+        try:
+            return int(info[b"length"])
+        except Exception:
+            return 0
+    total = 0
+    for entry in info.get(b"files") or []:
+        try:
+            total += int(entry.get(b"length", 0))
+        except Exception:
+            pass
+    return total
+
+def human_gb(nbytes: int) -> str:
+    if not nbytes or nbytes < 0:
+        return "—"
+    gb = nbytes / (1024 ** 3)
+    if gb >= 10:
+        return f"{gb:.0f} GB"
+    if gb >= 1:
+        return f"{gb:.1f} GB"
+    mb = nbytes / (1024 ** 2)
+    return f"{mb:.0f} MB"
+
+# ------------------ UI: BusyDialog (loader visual modal) ------------------ #
+
+class BusyDialog(tk.Toplevel):
+    """Diálogo modal simple, siempre visible y centrado, con progressbar indeterminada."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.withdraw()
+        self.title("Cargando…")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+
+        container = ttk.Frame(self, padding=16)
+        container.pack(fill="both", expand=True)
+        self.lbl = ttk.Label(container, text="Cargando…", font=("Segoe UI", 10, "bold"))
+        self.lbl.pack(pady=(0, 8))
+        self.pb = ttk.Progressbar(container, mode="indeterminate", length=260)
+        self.pb.pack(fill="x")
+
+    def show(self, text="Cargando…"):
+        self.lbl.configure(text=text)
+        # Asegura cálculo de tamaños del padre y de este diálogo
+        self.master.update_idletasks()
+        self.update_idletasks()
+        # centra sobre el padre
+        parent = self.master
+        pw = parent.winfo_width() or parent.winfo_reqwidth()
+        ph = parent.winfo_height() or parent.winfo_reqheight()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        w, h = 320, 90
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.deiconify()
+        # Fuerza que quede por delante y se pinte ya
+        self.lift(parent)
+        self.attributes("-topmost", True)
+        self.focus_force()
+        self.update_idletasks()
+        self.update()
+        self.pb.start(25)
+        self.grab_set()  # modal
+
+    def hide(self):
+        try:
+            self.pb.stop()
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.withdraw()
+
 # ------------------ UI: widgets auxiliares ------------------ #
 
 class ScrollableCheckFrame(ttk.Frame):
@@ -675,12 +793,13 @@ class ScrollableCheckFrame(ttk.Frame):
         self.vars.clear()
         self.labels.clear()
 
-    def add_item(self, text, checked=True):
+    def add_item(self, label, checked=True, label_override=None):
         var = tk.BooleanVar(value=checked)
-        cb = ttk.Checkbutton(self.inner, text=text, variable=var)
+        txt = label_override or label
+        cb = ttk.Checkbutton(self.inner, text=txt, variable=var)
         cb.pack(fill="x", padx=6, pady=2, anchor="w")
         self.vars.append(var)
-        self.labels.append(text)
+        self.labels.append(label)
 
     def get_checked_items(self):
         return [t for v, t in zip(self.vars, self.labels) if v.get()]
@@ -700,12 +819,14 @@ class App(tk.Tk):
 
         # Estado
         self.dest_folder = r"\\NAS\nas\Descargas\.torrent"
+        self.cache_dir = (os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'torrent_cache') if os.name=='nt' else os.path.join('/tmp','torrent_cache'))
+        self.cache_index = {}  # url -> {'path': str, 'bytes': int}
 
         # Variables UI
         self.mode_var = tk.StringVar(value="name")  # "url" | "name"
         self.input_var = tk.StringVar(value="")
         self.manual_proxy_var = tk.StringVar(value="")  # opcional
-        self.save_html_var = tk.BooleanVar(value=False)  # guardar HTML de depuración
+        self.save_html_var = tk.BooleanVar(value=False)  # guardar HTML (depuración)
         self.status_var = tk.StringVar(value="Listo.")
         self.total_var = tk.IntVar(value=0)
         self.done_var = tk.IntVar(value=0)
@@ -714,13 +835,9 @@ class App(tk.Tk):
         self.search_results = []   # lista de dicts
         self.tree_iid_to_index = {}  # iid -> índice en self.search_results
 
-        # ---------- Loader con recuento ----------
+        # ---------- Loader con recuento + diálogo modal ----------
         self._busy_count = 0
-        self._spinner_running = False
-        self._spinner_job = None
-        self._spinner_idx = 0
-        self._busy_text = "Cargando…"
-        self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self.loader = BusyDialog(self)
 
         # Layout
         self._build_topbar()
@@ -744,54 +861,34 @@ class App(tk.Tk):
             pass
         print(line, end="")
 
-    # ---------- Loader (spinner+barra) ---------- #
-
-    def _spin_tick(self):
-        if not self._spinner_running:
-            return
-        ch = self._spinner_frames[self._spinner_idx % len(self._spinner_frames)]
-        self._spinner_idx += 1
-        try:
-            self.status_var.set(f"{self._busy_text} {ch}")
-        finally:
-            self._spinner_job = self.after(100, self._spin_tick)
+    # ---------- Loader (modal) ---------- #
 
     def start_loading(self, text="Cargando…"):
-        """Incrementa contador de tareas y arranca el spinner si pasa de 0 -> 1."""
+        """Incrementa contador de tareas y muestra el diálogo si pasa de 0 -> 1."""
         self._busy_count += 1
-        if text:
-            self._busy_text = text
         if self._busy_count == 1:
-            # Arranca animación
-            self._spinner_running = True
-            self._spinner_idx = 0
-            try:
-                self.progress.configure(mode="indeterminate", value=0)
-                self.progress.start(30)
-            except Exception:
-                pass
-            self._spin_tick()
+            # deshabilita acciones mientras carga
+            self.search_btn.configure(state="disabled")
+            self.open_result_btn.configure(state="disabled")
+            self.download_btn.configure(state="disabled")
+            self.loader.show(text)
+            self.update_idletasks()
 
     def stop_loading(self, final_text="Listo."):
-        """Decrementa contador de tareas; si llega a 0, detiene animación y fija estado."""
+        """Decrementa contador; si llega a 0, oculta el diálogo y re-habilita UI."""
         if self._busy_count > 0:
             self._busy_count -= 1
         if self._busy_count > 0:
-            # Aún quedan tareas en curso; no paramos
             return
-        self._spinner_running = False
         try:
-            if self._spinner_job:
-                self.after_cancel(self._spinner_job)
-                self._spinner_job = None
-        except Exception:
-            pass
-        try:
-            self.progress.stop()
-            self.progress.configure(mode="determinate", value=0)
-        except Exception:
-            pass
-        self.status_var.set(final_text)
+            self.loader.hide()
+        finally:
+            # re-habilita botones (según contexto)
+            self.search_btn.configure(state="normal")
+            if self.results_tree.get_children():
+                self.open_result_btn.configure(state="normal")
+                self.clear_results_btn.configure(state="normal")
+            self.status_var.set(final_text)
 
     # ---------- Secciones UI ---------- #
 
@@ -902,20 +999,60 @@ class App(tk.Tk):
         self.download_btn.configure(state="normal" if enabled else "disabled")
 
     def show_torrents(self, links):
+        # Limpiar UI y desactivar acciones
         self.list_frame.clear()
-        if links:
-            for l in links:
-                self.list_frame.add_item(l, checked=True)
-            self.enable_torrent_actions(True)
-            self.status_var.set(f"Encontrados {len(links)} enlaces .torrent.")
-            self.log(f"[OK] .torrent encontrados: {len(links)}")
-        else:
-            self.enable_torrent_actions(False)
+        self.enable_torrent_actions(False)
+
+        if not links:
             self.status_var.set("No se encontraron enlaces .torrent.")
             self.log("[WARN] No se encontraron enlaces .torrent en la página cargada.")
+            return
+
+        # Preparar caché
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception as e:
+            self.log(f"[WARN] No se pudo crear caché: {e}")
+
+        self.start_loading("Descargando .torrent y leyendo tamaños…")
+        self.cache_index.clear()
+        qlinks = list(links)
+
+        def worker():
+            ok_count = 0
+            for i, url in enumerate(qlinks, 1):
+                # Descargar a caché
+                ok, path_or_msg = download_file(url, self.cache_dir)
+                if not ok:
+                    self.log(f"[ERR] Falló cache de {url}: {path_or_msg}")
+                    continue
+                fp = path_or_msg
+                # Calcular tamaño
+                try:
+                    total_bytes = parse_torrent_total_bytes(fp)
+                except Exception as e:
+                    total_bytes = 0
+                    self.log(f"[WARN] No se pudo parsear {os.path.basename(fp)}: {e}")
+                self.cache_index[url] = {"path": fp, "bytes": total_bytes}
+
+                label_txt = f"{url}  ·  {human_gb(total_bytes)}"
+                # Añadir a UI con etiqueta decorada, guardando URL real
+                self.after(0, lambda u=url, s=label_txt: self.list_frame.add_item(u, checked=True, label_override=s))
+
+                ok_count += 1
+                self.after(0, lambda i=i, n=len(qlinks): self.status_var.set(f"Preparando {i}/{n}…"))
+
+            def finish():
+                self.stop_loading(f"Preparados {ok_count} de {len(qlinks)} .torrent.")
+                self.enable_torrent_actions(True if ok_count else False)
+                if not ok_count:
+                    messagebox.showwarning("Sin elementos", "No se pudo preparar ningún .torrent.")
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def populate_search_results(self, results):
-        # results: lista de dicts
         for iid in self.results_tree.get_children():
             self.results_tree.delete(iid)
         self.search_results = results[:]  # copia
@@ -988,7 +1125,7 @@ class App(tk.Tk):
             messagebox.showwarning("Falta entrada", "Introduce una URL o un nombre.")
             return
 
-        self.start_loading("Buscando")
+        self.start_loading("Buscando…")
         self.enable_torrent_actions(False)
         self.list_frame.clear()
 
@@ -1039,6 +1176,75 @@ class App(tk.Tk):
                 self.after(0, lambda: self.stop_loading("Error."))
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_download(self):
+        selected = self.list_frame.get_checked_items()
+        if not selected:
+            messagebox.showinfo("Sin selección", "Marca al menos un enlace para conservar.")
+            return
+
+        missing = [u for u in selected if u not in self.cache_index]
+        if missing:
+            messagebox.showerror("Faltan en caché", "Hay elementos sin preparar:\n\n" + "\n".join(missing[:10]))
+            return
+
+        self.start_loading("Moviendo selección y limpiando caché…")
+        dest = self.dest_folder
+        os.makedirs(dest, exist_ok=True)
+        keep_set = set(selected)
+
+        def worker():
+            errs = []
+            moved = 0
+
+            # Mover seleccionados
+            for url in selected:
+                info = self.cache_index.get(url, {})
+                src_fp = info.get("path")
+                if not src_fp or not os.path.exists(src_fp):
+                    errs.append(f"No existe en caché: {url}")
+                    continue
+                try:
+                    base = os.path.basename(src_fp)
+                    dst = os.path.join(dest, base)
+                    i = 1
+                    root, ext = os.path.splitext(dst)
+                    while os.path.exists(dst):
+                        dst = f"{root} ({i}){ext}"
+                        i += 1
+                    os.replace(src_fp, dst)
+                    moved += 1
+                except Exception as e:
+                    errs.append(f"Error moviendo {src_fp}: {e}")
+
+            # Borrar no seleccionados
+            for url, info in list(self.cache_index.items()):
+                if url in keep_set:
+                    continue
+                fp = info.get("path")
+                try:
+                    if fp and os.path.exists(fp):
+                        os.remove(fp)
+                except Exception:
+                    pass
+
+            # Intentar borrar carpeta de caché si queda vacía
+            try:
+                if os.path.isdir(self.cache_dir) and not os.listdir(self.cache_dir):
+                    os.rmdir(self.cache_dir)
+            except Exception:
+                pass
+
+            def finish():
+                self.stop_loading("Completado.")
+                if errs:
+                    messagebox.showwarning("Concluido con avisos", "\n\n".join(errs[:10]))
+                else:
+                    messagebox.showinfo("Descargas", f"Se movieron {moved} .torrent a la carpeta destino.")
+                self.log(f"[CACHE] Movidos {moved}. Limpieza completada.")
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_open_selected_result(self):
         sel = self.results_tree.selection()
         if not sel:
@@ -1054,7 +1260,7 @@ class App(tk.Tk):
             messagebox.showwarning("Selección inválida", "No se pudo leer la URL seleccionada.")
             return
 
-        self.start_loading("Cargando ficha")
+        self.start_loading("Cargando ficha…")
         self.enable_torrent_actions(False)
         self.list_frame.clear()
         self.log(f"[OPEN] Cargando ficha: {title} | {url}")
@@ -1123,8 +1329,11 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-# --------------- main --------------- #
 
-if __name__ == "__main__":
+# --------------- main --------------- #
+def main() -> None:
     app = App()
     app.mainloop()
+
+if __name__ == "__main__":
+    main()
