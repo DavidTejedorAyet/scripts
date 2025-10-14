@@ -91,8 +91,22 @@ SERIES_WITH_TITLE = [
     re.compile(r'^\s*(?P<title>.+?)[\s._\-]*S(?P<s>\d{1,2})E(?P<e>\d{1,3})\b', re.IGNORECASE),
     re.compile(r'^\s*(?P<title>.+?)[\s._\-]*(?P<s>\d{1,2})x(?P<e>\d{1,3})\b', re.IGNORECASE),
 ]
+
+# Extensiones españolas para títulos con episodio
+SERIES_WITH_TITLE += [
+    re.compile(r'^\s*(?P<title>.+?)[\s._\-]*T(?P<s>\d{1,2})[\s._\-]*E(?P<e>\d{1,3})\b', re.IGNORECASE),
+    re.compile(r'^\s*(?P<title>.+?)\s*[-–—]\s*(?:Cap(?:[íi]tulo)?|Episodio)\s*(?P<e>\d{1,3})\b', re.IGNORECASE),
+]
 PATTERN_SxxEyy = re.compile(r'(?i)(?:^|[^A-Za-z0-9])S(?P<s>\d{1,2})E(?P<e>\d{1,3})(?:[^A-Za-z0-9]|$)')
 PATTERN_NxM   = re.compile(r'(?i)(?:^|[^A-Za-z0-9])(?P<s>\d{1,2})x(?P<e>\d{1,3})(?:[^A-Za-z0-9]|$)')
+PATTERN_TxxExx = re.compile(r'(?i)(?:^|[^A-Za-z0-9])T(?P<s>\d{1,2})[\s._\-]*E(?P<e>\d{1,3})(?:[^A-Za-z0-9]|$)')
+PATTERN_CAP_ONLY = re.compile(r'(?i)(?:cap(?:[íi]tulo)?|episodio)\s*[:\.#-]?\s*(?P<cap>\d{1,4})(?:[\s_\-]*[\[\]\(\)]*[\s_\-]*(?P<cap2>\d{1,4}))?')
+PATTERN_TEMP_IN_NAME = re.compile(r'(?i)\b(?:temp(?:orada)?)[\.\s]*?(?P<season>\d{1,2})\b')
+PATTERN_COMPACT_NUM = re.compile(r'(?<!\\d)(?P<num>\\d{3,4})(?!\\d)')
+SERIES_CODE_MAP = {
+    'clv': 'CSI Las Vegas', 'clve': 'CSI Las Vegas', 'clveg': 'CSI Las Vegas', 'clve': 'CSI Las Vegas', 'clveg': 'CSI Las Vegas',
+    'csi': 'CSI',
+}
 
 RELEASE_KEYWORDS = {
     "hdtv","dvb","webrip","webdl","web-dl","hdrip","bdrip","brrip","bluray","bray","dvdrip","dvdscr","screener","remux",
@@ -245,8 +259,17 @@ def load_aliases() -> None:
 
 load_aliases()
 
+
+def _normalize_acronyms(title: str) -> str:
+    if not title:
+        return title
+    t = title
+    t = re.sub(r'(?i)\b([A-Z])\s*[\.-]?\s*([A-Z])\s*[\.-]?\s*([A-Z])\b', lambda m: (m.group(1)+m.group(2)+m.group(3)), t)
+    t = t.replace('.', ' ')
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
 def canonicalize_show_title(candidate: str) -> str:
-    cand = sanitize_filename(beautify_spaces(candidate or "")) or "Desconocido"
+    cand = sanitize_filename(beautify_spaces(_normalize_acronyms(candidate or ""))) or "Desconocido"
     key = _slug_noaccents(cand)
     if key in ALIAS_MAP:
         return ALIAS_MAP[key]
@@ -260,16 +283,23 @@ def canonicalize_show_title(candidate: str) -> str:
             SHOW_CANON_MAP[key] = cand
     return SHOW_CANON_MAP[key]
 
+
+def _strip_trailing_season_tokens(title: str) -> str:
+    if not title:
+        return title
+    # elimina ' - Temporada 10' o ' Temp 10' SOLO al final
+    t = re.sub(r'(?i)[\s._\-]*\b(?:temporada|season|temp\.?|temp)\s*\d{1,2}\b\s*$', '', title).strip(" -._")
+    return t
 def choose_show_title(*cands: Optional[str]) -> str:
     for c in cands:
         if c and c.strip():
-            return canonicalize_show_title(c)
+            return canonicalize_show_title(_strip_trailing_season_tokens(c))
     return "Desconocido"
 
 
 # ---------- Contexto por carpeta contenedora ----------
 RE_SEASON_IN_DIR = re.compile(
-    r'(?i)\b(?:temporada|season)\s*(?P<num>\d{1,2})\b|(?:^|\W)(?:s|t)\s*(?P<num2>\d{1,2})(?:\b|[^a-z0-9])'
+    r'(?i)\b(?:temporada|season|temp\.?|temp)\s*(?P<num>\d{1,2})\b|(?:^|\W)(?:s|t)\s*(?P<num2>\d{1,2})(?:\b|[^a-z0-9])'
 )
 
 def parent_dir(path: str) -> str:
@@ -306,9 +336,18 @@ def parse_parent_context(src_path: str) -> Dict[str, Optional[str]]:
     if season is not None:
         show_title = re.sub(r'(?i)\b(?:temporada|season)\s*\d{1,2}\b.*$', '', cleaned).strip(" -_.")
         show_title = re.sub(r'(?i)(?:^|\W)(?:s|t)\s*\d{1,2}.*$', '', show_title).strip(" -_.")
+        # Map códigos como CLV1407 -> 'CSI Las Vegas'
+        m_code = re.match(r'^(?P<code>[A-Za-z]{2,6})\s*\d{3,4}$', show_title, flags=re.IGNORECASE)
+        if m_code:
+            code_key = m_code.group('code').lower()
+            mapped = SERIES_CODE_MAP.get(code_key)
+            if mapped:
+                show_title = mapped
         show_title = clean_folder_title(show_title)
 
-    movie_title = cleaned_basic
+    # Si la carpeta parece de serie (Temporada/Temp./Season o Cap.), no la usamos como título de película
+    looks_like_series = bool(RE_SEASON_IN_DIR.search(cleaned)) or bool(re.search(r'(?i)\bcap(?:[íi]tulo)?\.?\s*\d+', cleaned))
+    movie_title = None if looks_like_series else cleaned_basic
 
     return {
         "folder": folder,
@@ -410,7 +449,7 @@ def guess_show_from_parent_dir(src_path: str) -> Optional[str]:
     if _is_protected_dirname(parent):
         return None
     parent = beautify_spaces(strip_release_tags(parent))
-    m = re.search(r"^(?P<title>.+?)\s*-\s*Temporada\b", parent, flags=re.IGNORECASE)
+    m = re.search(r"^(?P<title>.+?)\s*-\s*(?:Temporada|Temp\.?|Season)\b", parent, flags=re.IGNORECASE)
     if m:
         return sanitize_filename(beautify_spaces(m.group("title")))
     parent = re.sub(r"\b(Temporada|Completa|DVDRip|HDTV|WEB[- ]?DL|BluRay)\b.*$", "", parent, flags=re.IGNORECASE).strip(" -")
@@ -430,6 +469,76 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
     folder_show_title = ctx["show_title"]
     folder_season = ctx["season"]
 
+    # 0-ter) Si el ARCHIVO trae Cap.####, priorizar episodio único del propio archivo (evita rangos por carpeta)
+    m_cap_file_early = re.search(r'(?i)\bcap(?:[íi]tulo)?\s*[:\.#-]?\s*(\d{3,4})\b', stem) or re.search(r'(?i)\bcap(?:[íi]tulo)?\s*[:\.#-]?\s*(\d{3,4})\b', cleaned_stem)
+    if m_cap_file_early:
+        val = _safe_int(m_cap_file_early.group(1), None)
+        if val is not None:
+            if val >= 100:
+                season = val // 100
+                episode = val % 100
+            else:
+                season = folder_season or 1
+                episode = val
+            show_title = choose_show_title(folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
+            ep_str = f"{season:02d}x{episode:02d}"
+            ep_title = clean_episode_title(cleaned_stem)
+            dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
+            base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
+            dst_name = sanitize_filename(f"{base}{ext}")
+            return MediaItem(src_path, "series", show_title, season, [episode], dst_name, dst_dir, os.path.join(dst_dir, dst_name))
+
+
+    # 0-bis) Serie por *carpeta* tipo código+compacto (p.ej., 'CLV1407') o carpeta con '[Cap.1407]'
+    parent_raw = ctx.get("folder", "") or ""
+    # a) Código+compacto en carpeta
+    m_dir_code = re.match(r'^(?P<code>[A-Za-z]{2,6})\s*(?P<num>\d{3,4})\b', parent_raw, flags=re.IGNORECASE)
+    if m_dir_code:
+        mapped = SERIES_CODE_MAP.get(m_dir_code.group('code').lower())
+        num = _safe_int(m_dir_code.group('num'), None)
+        if mapped and num and num >= 100:
+            season = num // 100
+            episode = num % 100
+            show_title = choose_show_title(mapped, folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
+            ep_title = ''  # evitar restos como 'CLV1407' u otros códigos en el título del episodio
+            ep_str = f"{season:02d}x{episode:02d}"
+            dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
+            base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
+            dst_name = sanitize_filename(f"{base}{ext}")
+            return MediaItem(src_path, "series", show_title, season, [episode], dst_name, dst_dir, os.path.join(dst_dir, dst_name))
+    # b) Carpeta con '[Cap.####]' y posible 'Temp X' sin información en archivo
+    m_cap_dir = re.search(r'(?i)\[\s*cap(?:[íi]tulo)?\s*[:\.#-]?\s*(\d{3,4})(?:[ _-]+(\d{3,4}))?\s*\]', parent_raw)
+    if m_cap_dir:
+        cap1 = _safe_int(m_cap_dir.group(1), None)
+        cap2 = _safe_int(m_cap_dir.group(2), None)
+        # Temporada por carpeta si existe
+        m_seas_dir = PATTERN_TEMP_IN_NAME.search(parent_raw) or RE_SEASON_IN_DIR.search(parent_raw)
+        season = None
+        if m_seas_dir:
+            season = _safe_int(m_seas_dir.group('season') if 'season' in m_seas_dir.groupdict() else (m_seas_dir.group('num') or m_seas_dir.group('num2')), None)
+        # Derivar season/episode de cap#### si hace falta
+        if cap1 and cap1 >= 100:
+            if season is None:
+                season = cap1 // 100
+                episode = cap1 % 100
+            else:
+                episode = cap1 if cap1 < 100 else (cap1 % 100)
+        elif cap1:
+            episode = cap1
+        else:
+            episode = 1
+        show_title = choose_show_title(_strip_trailing_season_tokens(folder_show_title), guess_show_from_parent_dir(src_path), "Desconocido")
+        if season is None:
+            season = folder_season or 1
+        ep_title = ''  # evitar restos como 'CLV1407' u otros códigos en el título del episodio
+        ep_str = f"{season:02d}x{episode:02d}" if not cap2 else f"{season:02d}x{min(episode, cap2%100):02d}-{season:02d}x{max(episode, cap2%100):02d}"
+        dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
+        base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
+        dst_name = sanitize_filename(f"{base}{ext}")
+        eps_list = [episode] if not cap2 else sorted({episode, cap2 % 100})
+        return MediaItem(src_path, "series", show_title, season, eps_list, dst_name, dst_dir, os.path.join(dst_dir, dst_name))
+
+
     # 1) "Franquicia 03 - Título" -> película numerada
     m_force = FALLBACK_NUMBERED_TITLE.match(cleaned_stem)
     if m_force:
@@ -448,9 +557,11 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
             season = _safe_int(m.group("s"), 1) or 1
             episode = _safe_int(m.group("e"), 1) or 1
             raw_title = m.group("title") or ""
-            raw_title = re.split(r"\bTemporada\b", raw_title, maxsplit=1, flags=re.IGNORECASE)[0]
+            raw_title = re.split(r"\bTemporada\b|\bTemp\.?\b|\bSeason\b", raw_title, maxsplit=1, flags=re.IGNORECASE)[0]
             show_title = choose_show_title(raw_title, folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
             ep_title = ep_title_from_match(cleaned_stem, m)
+            if ep_title and (_strip_trailing_season_tokens(ep_title).lower() in {show_title.lower(), show_title.lower() + ' temp'} or re.search(r'(?i)^(?:temp\.?|temporada|season)\s*\d{1,2}$', ep_title)):
+                ep_title = ''
             ep_str = f"{season:02d}x{episode:02d}"
             dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
             base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
@@ -458,7 +569,7 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
             return MediaItem(src_path, "series", show_title, season, [episode], dst_name, dst_dir, os.path.join(dst_dir, dst_name))
 
     # 3) Serie por patrones sin título explícito, usa carpeta si ayuda
-    for rx in (PATTERN_SxxEyy, PATTERN_NxM):
+    for rx in (PATTERN_SxxEyy, PATTERN_NxM, PATTERN_TxxExx):
         m = rx.search(cleaned_stem)
         if m:
             season = _safe_int(m.group("s"), 1) or folder_season or 1
@@ -466,19 +577,117 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
             prefix = re.sub(r"[\s._\-]+$", "", cleaned_stem[: m.start()])
             show_title = choose_show_title(prefix, folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
             ep_title = ep_title_from_match(cleaned_stem, m)
+            if ep_title and (_strip_trailing_season_tokens(ep_title).lower() in {show_title.lower(), show_title.lower() + ' temp'} or re.search(r'(?i)^(?:temp\.?|temporada|season)\s*\d{1,2}$', ep_title)):
+                ep_title = ''
             ep_str = f"{season:02d}x{episode:02d}"
             dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
             base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
             dst_name = sanitize_filename(f"{base}{ext}")
             return MediaItem(src_path, "series", show_title, season, [episode], dst_name, dst_dir, os.path.join(dst_dir, dst_name))
 
+
+    # 3-bis) Serie con 'Temp.X' y/o 'Cap.Y' (español) en archivo o carpeta
+    match_temp_file = PATTERN_TEMP_IN_NAME.search(cleaned_stem)
+    match_temp_dir  = PATTERN_TEMP_IN_NAME.search(ctx.get("folder",""))
+    m_cap_file = PATTERN_CAP_ONLY.search(stem) or PATTERN_CAP_ONLY.search(cleaned_stem)
+    m_cap_dir = PATTERN_CAP_ONLY.search(ctx.get("folder","")) or re.search(r"(?i)\[\s*cap(?:[íi]tulo)?\s*[:\.#-]?\s*(\d{3,4})(?:[ _-]+(\d{3,4}))?\s*\]", ctx.get("folder",""))
+    m_cap = m_cap_file or m_cap_dir
+    season_h = None
+    if match_temp_file:
+        season_h = _safe_int(match_temp_file.group("season"), None)
+    if season_h is None and match_temp_dir:
+        season_h = _safe_int(match_temp_dir.group("season"), None)
+    if m_cap or season_h:
+        title_from_file = re.split(r'\s*-\s*(?:Temporada|Temp\.?|Season)\b', cleaned_stem, maxsplit=1, flags=re.IGNORECASE)[0]
+        show_title = choose_show_title(title_from_file, folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
+        eps = []
+        if m_cap:
+            c1 = _safe_int(m_cap.group("cap"), None)
+            c2 = _safe_int(m_cap.group("cap2"), None)
+            if c1 is not None and (c1 >= 100 or (season_h and c1 >= 1)):
+                if season_h is None:
+                    if c1 >= 100:
+                        episode = c1 % 100
+                        season_h = c1 // 100
+                    else:
+                        episode = c1
+                else:
+                    if c1 >= 100 and (c1 // 100) == season_h:
+                        episode = c1 % 100
+                    else:
+                        episode = c1 if c1 < 100 else (c1 % 100)
+                eps.append(max(1, int(episode)))
+                if c2 is not None:
+                    if c2 >= 100 and season_h and (c2 // 100) == season_h:
+                        eps.append(c2 % 100)
+                    else:
+                        eps.append(c2 if c2 < 100 else (c2 % 100))
+            elif c1 is not None:
+                episode = c1 if c1 < 100 else (c1 % 100)
+                eps.append(max(1, int(episode)))
+        if not eps:
+            m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem) or PATTERN_TxxExx.search(cleaned_stem) or PATTERN_TxxExx.search(cleaned_stem)
+            if m_any:
+                eps.append(_safe_int(m_any.group('e'), 1) or 1)
+                if season_h is None:
+                    season_h = _safe_int(m_any.group('s'), 1) or 1
+        if season_h and eps:
+            season = max(1, int(season_h))
+            eps = sorted(set(eps))
+            ep_title = ''  # evitar restos como 'CLV1407' u otros códigos en el título del episodio
+            ep_str = f"{season:02d}x{eps[0]:02d}" if len(eps)==1 else f"{season:02d}x{eps[0]:02d}-{eps[-1]:02d}"
+            dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
+            base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
+            dst_name = sanitize_filename(f"{base}{ext}")
+            return MediaItem(src_path, "series", show_title, season, eps, dst_name, dst_dir, os.path.join(dst_dir, dst_name))
     # 4) Serie deducida por carpeta (Temporada X) y archivo numerado
+    #   Extra: soporta 'CLV1407...' o números compactos '1407' en cualquier parte
+    if folder_season is not None and folder_show_title:
+        # Prefijo de siglas + número
+        m_pref = re.match(r'^(?P<code>[A-Za-z]{2,6})\s*(?P<num>\d{3,4})\b', cleaned_stem, flags=re.IGNORECASE)
+        used = False
+        show_title = folder_show_title
+        if m_pref:
+            code_pref = m_pref.group('code').lower()
+            mapped = SERIES_CODE_MAP.get(code_pref)
+            if mapped:
+                show_title = choose_show_title(mapped, folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
+                num = _safe_int(m_pref.group('num'), None)
+                if num and num >= 100:
+                    season = folder_season or (num // 100)
+                    episode = num % 100
+                    ep_title = ''  # evitar restos de código en el nombre del episodio
+                    ep_str = f"{season:02d}x{episode:02d}"
+                    dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
+                    base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
+                    dst_name = sanitize_filename(f"{base}{ext}")
+                    return MediaItem(src_path, "series", show_title, season, [episode], dst_name, dst_dir, os.path.join(dst_dir, dst_name))
+                used = True
+        if not used:
+            # número compactado en cualquier parte
+            m_c = PATTERN_COMPACT_NUM.search(cleaned_stem)
+            if m_c:
+                num = _safe_int(m_c.group('num'), None)
+                if num and num >= 100:
+                    s_compact = num // 100
+                    e_compact = num % 100
+                    season = folder_season if folder_season else s_compact
+                    if s_compact and s_compact != season:
+                        season = s_compact
+                    show_title = choose_show_title(_strip_trailing_season_tokens(folder_show_title), guess_show_from_parent_dir(src_path), "Desconocido")
+                    ep_title = clean_episode_title(cleaned_stem[:m_c.start()] + cleaned_stem[m_c.end():])
+                    ep_str = f"{season:02d}x{e_compact:02d}"
+                    dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
+                    base = f"{show_title} - {ep_str}" + (f" - {ep_title}" if ep_title else "")
+                    dst_name = sanitize_filename(f"{base}{ext}")
+                    return MediaItem(src_path, "series", show_title, season, [e_compact], dst_name, dst_dir, os.path.join(dst_dir, dst_name))
+
     if folder_season is not None and folder_show_title:
         m = re.match(r'^\s*(?P<e>\d{1,3})(?:\s*[-_. ]\s*|)(?P<ttl>.*)$', cleaned_stem)
         if m:
             episode = _safe_int(m.group("e"), 1) or 1
             ep_title = clean_episode_title(m.group("ttl"))
-            show_title = choose_show_title(folder_show_title, guess_show_from_parent_dir(src_path), "Desconocido")
+            show_title = choose_show_title(_strip_trailing_season_tokens(folder_show_title), guess_show_from_parent_dir(src_path), "Desconocido")
             season = folder_season or 1
             ep_str = f"{season:02d}x{episode:02d}"
             dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
@@ -504,7 +713,7 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
                 episode = _safe_int(episode, 1) or 1
                 ep_title = clean_episode_title(info.get("episodeName") or info.get("episode_name") or info.get("episode_title") or "")
                 if not ep_title:
-                    m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem)
+                    m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem) or PATTERN_TxxExx.search(cleaned_stem)
                     if m_any: ep_title = ep_title_from_match(cleaned_stem, m_any)
                 ep_str = f"{season:02d}x{episode:02d}"
                 dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
@@ -545,7 +754,7 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
                     eps = [v if v is not None else 1]
                 ep_title = clean_episode_title(info.get("episode_title") or "")
                 if not ep_title:
-                    m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem)
+                    m_any = PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem) or PATTERN_TxxExx.search(cleaned_stem)
                     if m_any: ep_title = ep_title_from_match(cleaned_stem, m_any)
                 ep_str = f"{season:02d}x{eps[0]:02d}" if len(eps) == 1 else f"{season:02d}x{eps[0]:02d}-{eps[-1]:02d}"
                 dst_dir = os.path.join(dst_root, "Series", show_title, f"Temporada {season:02d}")
@@ -562,14 +771,16 @@ def build_media_item(src_path: str, dst_root: str) -> Optional[MediaItem]:
         except Exception:
             pass
 
-    # 6) Película por carpeta (solo si no es protegida)
-    if folder_movie_title:
+    # 6) Película por carpeta (solo si no es protegida y la carpeta NO tiene pinta de serie)
+    if folder_movie_title and not (folder_show_title or folder_season is not None):
         base = sanitize_filename(beautify_spaces(folder_movie_title))
         dst_dir = os.path.join(dst_root, "Películas")
         dst_name = f"{base}{ext}"
         return MediaItem(src_path, "movie", None, None, None, dst_name, dst_dir, os.path.join(dst_dir, dst_name))
 
-    # 7) Fallback película por nombre de archivo limpio
+    # 7) Fallback película por nombre de archivo limpio (solo si no hay ninguna señal de serie)
+    if folder_show_title or folder_season is not None or PATTERN_SxxEyy.search(cleaned_stem) or PATTERN_NxM.search(cleaned_stem) or ("temp" in cleaned_stem.lower()) or PATTERN_TxxExx.search(cleaned_stem):
+        return None
     base = sanitize_filename(beautify_spaces(cleaned_stem) or "Pelicula_Desconocida")
     dst_dir = os.path.join(dst_root, "Películas")
     dst_name = f"{base}{ext}"
